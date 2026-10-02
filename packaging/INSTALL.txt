@@ -1,0 +1,47 @@
+Sigma fp RAW - OpenFX plug-in for DaVinci Resolve
+=================================================
+
+This folder holds one plug-in bundle that works on Windows, macOS and Linux:
+
+    SigmaFpRaw.ofx.bundle
+
+Close DaVinci Resolve first, then install in one of two ways.
+
+
+1. Copy the folder (works everywhere)
+-------------------------------------
+Copy the whole SigmaFpRaw.ofx.bundle folder into the OFX plug-in folder of your system.
+Create the folder if it does not exist. Replace an older SigmaFpRaw.ofx.bundle if there is one.
+
+    Windows   C:\Program Files\Common Files\OFX\Plugins
+    macOS     /Library/OFX/Plugins
+    Linux     /usr/OFX/Plugins
+
+Windows and macOS ask for an administrator password, because the folder belongs to the system.
+
+macOS only: files downloaded from the internet are held back by Gatekeeper. After copying,
+open Terminal and run this once:
+
+    sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/SigmaFpRaw.ofx.bundle
+
+
+2. Run the install script (does the same copy for you)
+------------------------------------------------------
+    Windows   double-click Install-Windows.bat and accept the administrator prompt
+    macOS     right-click Install-macOS.command, choose Open, and type your password
+    Linux     in a terminal:  sh install-linux.sh
+
+
+After installing
+----------------
+Start DaVinci Resolve. On the Color page, open Effects (OpenFX) and find "Sigma fp RAW" in the
+"Sigma fp" group. Put it on the first node of a Sigma fp CinemaDNG clip.
+
+If it is not listed: Resolve > Preferences > Video Plugins shows the plug-ins that failed to load.
+
+The full guide is in SigmaFpRaw.ofx.bundle/Contents/Resources/README.md.
+
+
+Uninstall
+---------
+Delete SigmaFpRaw.ofx.bundle from the OFX plug-in folder above.

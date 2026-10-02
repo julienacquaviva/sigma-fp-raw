@@ -1,0 +1,148 @@
+name: build
+
+# Builds the plug-in for Windows, macOS and Linux, loads and self-tests it on each system, and
+# on a version tag (v1.4.0) publishes the installers as a GitHub release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Build all platforms
+    # A Mac builds everything: Apple's clang for the macOS binary, zig for Windows and Linux.
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install "ziglang>=0.14,<0.15"
+      - id: version
+        run: echo "version=$(python -c "import build; print(build.VERSION)")" >> "$GITHUB_OUTPUT"
+      - name: Tag matches the version in build.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "${GITHUB_REF_NAME}" = "v${{ steps.version.outputs.version }}"
+      - name: Build
+        run: python build.py --targets all --package
+      - name: Self-test (Apple Silicon)
+        run: |
+          ./build/sfp_cli selftest tests/data/A001_092.FPG
+          python tools/check_plugin.py
+          lipo -info dist/SigmaFpRaw.ofx.bundle/Contents/MacOS/SigmaFpRaw.ofx
+          codesign --verify --verbose dist/SigmaFpRaw.ofx.bundle/Contents/MacOS/SigmaFpRaw.ofx
+      - name: Self-test (Intel half, under Rosetta)
+        run: |
+          softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+          arch -x86_64 ./build/sfp_cli selftest tests/data/A001_092.FPG
+      - name: macOS installer package
+        run: |
+          V=${{ steps.version.outputs.version }}
+          ROOT=pkgroot/Library/OFX/Plugins/SigmaFpRaw.ofx.bundle/Contents
+          mkdir -p "$ROOT"
+          cp -R dist/SigmaFpRaw.ofx.bundle/Contents/MacOS dist/SigmaFpRaw.ofx.bundle/Contents/Resources dist/SigmaFpRaw.ofx.bundle/Contents/Info.plist "$ROOT/"
+          pkgbuild --analyze --root pkgroot component.plist
+          plutil -replace 0.BundleIsRelocatable -bool NO component.plist || true
+          pkgbuild --root pkgroot --component-plist component.plist --identifier com.sigmafpmods.raw \
+                   --version "$V" --install-location / "dist/SigmaFpRaw-$V-macOS.pkg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: dist/SigmaFpRaw.ofx.bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli
+          path: |
+            build/win64/sfp_cli.exe
+            build/linux64/sfp_cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            dist/*.zip
+            dist/*.pkg
+
+  test:
+    name: Self-test on ${{ matrix.os }}
+    needs: bundle
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            cli: build/win64/sfp_cli.exe
+          - os: ubuntu-latest
+            cli: build/linux64/sfp_cli
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: bundle
+          path: dist/SigmaFpRaw.ofx.bundle
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli
+          path: build
+      - name: Self-test
+        shell: bash
+        run: |
+          chmod +x ${{ matrix.cli }} || true
+          ${{ matrix.cli }} selftest tests/data/A001_092.FPG
+          python tools/check_plugin.py
+
+  windows-installer:
+    name: Windows installer
+    needs: bundle
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bundle
+          path: dist/SigmaFpRaw.ofx.bundle
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=${{ needs.bundle.outputs.version }}" packaging\windows-installer.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/*.exe
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [bundle, test, windows-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: out
+      - name: Checksums
+        run: cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* --title "Sigma fp RAW ${GITHUB_REF_NAME#v}" --notes-file packaging/RELEASE_NOTES.md

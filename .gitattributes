@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.iss text eol=crlf
+*.FPG binary
+*.bin binary
+*.png binary
+src/generated/kernels_ptx.h linguist-generated=true -diff

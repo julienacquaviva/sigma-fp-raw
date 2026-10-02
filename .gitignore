@@ -1,0 +1,10 @@
+build/
+dist/
+__pycache__/
+*.pyc
+*.pdb
+# Local test material that is not published: a picture of a screen with third-party content,
+# a DNG header with the camera serial number, and test reports.
+tests/A001_065_f102_row_phase_before_after.png
+tests/data/frame_header.bin
+tests/*_report.json
