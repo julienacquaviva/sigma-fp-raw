@@ -37,7 +37,7 @@ jobs:
           ./build/sfp_cli selftest tests/data/A001_092.FPG
           python tools/check_plugin.py
           lipo -info dist/SigmaFpRaw.ofx.bundle/Contents/MacOS/SigmaFpRaw.ofx
-          codesign --verify --verbose dist/SigmaFpRaw.ofx.bundle/Contents/MacOS/SigmaFpRaw.ofx
+          codesign --verify --verbose build/macos/SigmaFpRaw.ofx
       - name: Self-test (Intel half, under Rosetta)
         run: |
           softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
@@ -70,7 +70,7 @@ jobs:
             dist/*.pkg
 
   test:
-    name: Self-test on ${{ matrix.os }}
+    name: Self-test (${{ matrix.os }})
     needs: bundle
     strategy:
       fail-fast: false

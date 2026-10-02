@@ -107,7 +107,11 @@ def build_target(name, zig, bundle):
     binary = bundle / 'Contents' / folder / 'SigmaFpRaw.ofx'
     cli = ROOT / 'build' / ('sfp_cli' + exe if name == HOST else f'{name}/sfp_cli{exe}')
     if name == 'macos' and HOST == 'macos':
-        apple_build(plugin_src, binary, True)
+        # Built and signed outside the bundle: signing a file inside it would seal the bundle's
+        # other files, which are still to be written.
+        apple_build(plugin_src, ROOT / 'build/macos/SigmaFpRaw.ofx', True)
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / 'build/macos/SigmaFpRaw.ofx', binary)
         apple_build(cli_src, cli, False)
     elif len(variants) == 1:
         target, cpu = variants[0]
