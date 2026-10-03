@@ -62,7 +62,8 @@ const OfxMessageSuiteV1* gMsg1 = nullptr;
 
 // ---- parameter names ----
 const char* WB_OPTIONS[] = {"As Shot", "Daylight", "Cloudy", "Shade", "Tungsten", "Fluorescent", "Flash", "Custom"};
-const char* CS_OPTIONS[] = {"Rec.709", "P3 D65", "Rec.2020", "DaVinci Wide Gamut", "ACES AP0", "ACES AP1"};
+const char* CS_OPTIONS[] = {"Rec.709", "P3 D65", "Rec.2020", "DaVinci Wide Gamut", "ACES AP0", "ACES AP1", "ARRI Wide Gamut 3"};
+const char* CAM_OPTIONS[] = {"As Recorded", "Chart-Fitted (daylight)"};
 const char* GAMMA_OPTIONS[] = {"Linear", "Gamma 2.2", "Gamma 2.4", "Rec.709", "sRGB", "DaVinci Intermediate", "ACEScct"};
 
 struct Instance {
@@ -200,7 +201,13 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     const char* dq[] = {"Full Res. (RCD)", "Half Res."};
     d.choice("decodeQuality", "Decode Quality", dq, 2, 0, "raw", "Full: RCD demosaic at full resolution. Half: 2x2 binned, fastest.");
     d.choice("whiteBalance", "White Balance", WB_OPTIONS, 8, 0, "raw", "As Shot uses the camera's AsShotNeutral. Editing Color Temp or Tint switches to Custom.");
-    d.choice("colorSpace", "Color Space", CS_OPTIONS, 6, 0, "raw", "Output primaries.");
+    d.choice("cameraMatrix", "Camera Matrix", CAM_OPTIONS, 2, 0, "raw",
+             "As Recorded: the file's ColorMatrix1/2. In Color Mode OFF those are a Rec.709 stand-in, not a sensor "
+             "calibration, so colour comes out at about half chroma. Chart-Fitted: a ColorChecker fit of the fp "
+             "sensor (CIEDE2000 1.7 vs 9.6 for OFF) with the same white balance and Temp/Tint. Daylight-fitted; "
+             "under tungsten it is adapted, not yet measured.");
+    d.choice("colorSpace", "Color Space", CS_OPTIONS, 7, 0, "raw", "Output primaries. ARRI Wide Gamut 3 with Linear gamma "
+             "feeds a Color Space Transform to LogC3 for ARRI LUTs.");
     d.choice("gamma", "Gamma", GAMMA_OPTIONS, 7, 3, "raw", "Output encoding. Rec.709 has a linear toe; pure Gamma 2.2/2.4 make near-black noise sparkle. Use DaVinci Wide Gamut / DaVinci Intermediate in a DWG-managed project.");
     d.number("colorTemp", "Color Temp", 5600, 1500, 50000, 2000, 15000, "raw", "Kelvin (DNG colour calibration).", 0);
     d.number("tint", "Tint", 0, -150, 150, -150, 150, "raw", "Green-magenta balance.", 0);
@@ -316,7 +323,8 @@ RawSettings settings(Instance& in, double t) {
     RawSettings s;
     s.decodeQuality = ival(in, "decodeQuality", t);
     s.whiteBalance = static_cast<WhiteBalance>(std::clamp(ival(in, "whiteBalance", t), 0, 7));
-    s.colorSpace = static_cast<Primaries>(std::clamp(ival(in, "colorSpace", t), 0, 5));
+    s.colorSpace = static_cast<Primaries>(std::clamp(ival(in, "colorSpace", t), 0, 6));
+    s.cameraMatrix = static_cast<CameraMatrix>(std::clamp(ival(in, "cameraMatrix", t), 0, 1));
     s.gamma = static_cast<Gamma>(std::clamp(ival(in, "gamma", t), 0, 6));
     s.colorTemp = dval(in, "colorTemp", t);
     s.tint = dval(in, "tint", t);
@@ -500,7 +508,7 @@ OfxStatus create_instance(OfxImageEffectHandle h) {
     gEffect->clipGetHandle(h, kOfxImageEffectSimpleSourceClipName, &in->source, nullptr);
     OfxParamSetHandle ps = nullptr;
     gEffect->getParamSet(h, &ps);
-    for (const char* n : {"info", "decodeQuality", "whiteBalance", "colorSpace", "gamma", "colorTemp", "tint", "exposure", "sharpness",
+    for (const char* n : {"info", "decodeQuality", "whiteBalance", "cameraMatrix", "colorSpace", "gamma", "colorTemp", "tint", "exposure", "sharpness",
                           "highlights", "shadows", "colorBoost", "saturation", "midtones", "lift", "gain", "contrast",
                           "highlightRecovery", "gamutMapping", "preToneCurve", "softClip", "rowPhase",
                           "deZigzag", "fit", "sourceFile", "frameMode", "anchor", "stabStatus", "stabEnable", "stabSmoothness",

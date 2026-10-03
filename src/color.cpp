@@ -1,4 +1,5 @@
 #include "color.h"
+#include "fp_chart_matrix.h"
 
 #include <algorithm>
 #include <cmath>
@@ -81,6 +82,7 @@ Space space(Primaries p) {
         case Primaries::DaVinciWideGamut: return {{0.8000, 0.3130, 0.1682, 0.9877, 0.0790, -0.1155}, d65x, d65y};
         case Primaries::ACES_AP0: return {{0.7347, 0.2653, 0.0000, 1.0000, 0.0001, -0.0770}, acesx, acesy};
         case Primaries::ACES_AP1: return {{0.713, 0.293, 0.165, 0.830, 0.128, 0.044}, acesx, acesy};
+        case Primaries::ArriWideGamut3: return {{0.6840, 0.3130, 0.2210, 0.8480, 0.0861, -0.1020}, d65x, d65y};
         default: return {{0.640, 0.330, 0.300, 0.600, 0.150, 0.060}, d65x, d65y};
     }
 }
@@ -107,21 +109,24 @@ double illuminant_temp(int code) {
     }
 }
 
-// XYZ -> camera for white xy (interpolate ColorMatrix1/2 in inverse temperature).
-Mat3 color_matrix(const DngInfo& d, double x, double y) {
-    Mat3 c1, c2;
-    for (int i = 0; i < 9; ++i) { c1.m[i] = d.cm1[i]; c2.m[i] = d.hasCM2 ? d.cm2[i] : d.cm1[i]; }
-    double t1 = illuminant_temp(d.illum1), t2 = illuminant_temp(d.illum2);
+// XYZ -> reference camera for white xy (interpolate ColorMatrix1/2 in inverse temperature).
+Mat3 interpolated_cm(const CmPair& p, double x, double y) {
+    Mat3 c1 = p.c1, c2 = p.hasCM2 ? p.c2 : p.c1;
+    double t1 = illuminant_temp(p.illum1), t2 = illuminant_temp(p.illum2);
     Mat3 cm = c1;
-    if (d.hasCM2 && t1 > 0 && t2 > 0 && t1 != t2) {
+    if (p.hasCM2 && t1 > 0 && t2 > 0 && t1 != t2) {
         if (t1 > t2) { std::swap(t1, t2); std::swap(c1, c2); }
         double t, tint;
         xy_to_temp_tint(x, y, t, tint);
         double g = t <= t1 ? 1.0 : t >= t2 ? 0.0 : (1.0 / t - 1.0 / t2) / (1.0 / t1 - 1.0 / t2);
         for (int i = 0; i < 9; ++i) cm.m[i] = g * c1.m[i] + (1 - g) * c2.m[i];
     }
-    Mat3 ab = diag(d.analog[0], d.analog[1], d.analog[2]);
-    return mul(ab, cm);
+    return cm;
+}
+
+// XYZ -> camera for white xy: AnalogBalance . interpolated ColorMatrix.
+Mat3 color_matrix(const CmPair& p, double x, double y) {
+    return mul(diag(p.analog[0], p.analog[1], p.analog[2]), interpolated_cm(p, x, y));
 }
 
 }  // namespace
@@ -177,7 +182,40 @@ void temp_tint_to_xy(double temperature, double tint, double& x, double& y) {
     }
 }
 
-ColorSetup color_setup(const DngInfo& d, bool asShot, double temp, double tint, Primaries out) {
+CmPair recorded_matrices(const DngInfo& d) {
+    CmPair p;
+    for (int i = 0; i < 9; ++i) { p.c1.m[i] = d.cm1[i]; p.c2.m[i] = d.cm2[i]; }
+    p.illum1 = d.illum1; p.illum2 = d.illum2; p.hasCM2 = d.hasCM2;
+    for (int i = 0; i < 3; ++i) p.analog[i] = d.analog[i];
+    return p;
+}
+
+// Chart-fitted pair (fp_chart_matrix.h): for each calibration white, keep the camera neutral the
+// recorded matrices give for it and replace only the colour. White balance and Temp/Tint stay where
+// they were, and a file that already carries this pair decodes the same either way.
+CmPair chart_fitted_matrices(const CmPair& rec) {
+    CmPair p = rec;
+    const double* slot[2] = {kFpChartStdA, kFpChartD65};
+    Mat3* cm[2] = {&p.c1, &p.c2};
+    const int code[2] = {17, 21};   // Standard A, D65
+    for (int k = 0; k < 2; ++k) {
+        // The file's matrix for this illuminant if it has one (the fp writes both), else interpolated.
+        const Mat3 rk = rec.illum1 == code[k] ? rec.c1 : rec.hasCM2 && rec.illum2 == code[k] ? rec.c2
+                                                       : interpolated_cm(rec, kFpChartWhite[k][0], kFpChartWhite[k][1]);
+        double w[3], n[3];
+        xy_to_XYZ(kFpChartWhite[k][0], kFpChartWhite[k][1], w);
+        mulv(rk, w, n);
+        if (!(n[0] > 0 && n[1] > 0 && n[2] > 0)) return rec;   // no usable recorded matrices
+        Mat3 s{};
+        for (int i = 0; i < 9; ++i) s.m[i] = slot[k][i];
+        *cm[k] = mul(diag(n[0], n[1], n[2]), s);
+    }
+    p.illum1 = code[0]; p.illum2 = code[1]; p.hasCM2 = true;
+    return p;
+}
+
+ColorSetup color_setup(const DngInfo& d, bool asShot, double temp, double tint, Primaries out, CameraMatrix cam) {
+    const CmPair cmp = cam == CameraMatrix::ChartFitted ? chart_fitted_matrices(recorded_matrices(d)) : recorded_matrices(d);
     const double d50x = 0.3457, d50y = 0.3585;
     double wx = d50x, wy = d50y;
     double neutral[3];
@@ -186,7 +224,7 @@ ColorSetup color_setup(const DngInfo& d, bool asShot, double temp, double tint, 
         // White xy from camera neutral: iterate matrix interpolation (DNG spec).
         for (int it = 0; it < 30; ++it) {
             double XYZ[3];
-            mulv(inv(color_matrix(d, wx, wy)), neutral, XYZ);
+            mulv(inv(color_matrix(cmp, wx, wy)), neutral, XYZ);
             double nx, ny;
             XYZ_to_xy(XYZ, nx, ny);
             if (std::fabs(nx - wx) < 1e-7 && std::fabs(ny - wy) < 1e-7) { wx = nx; wy = ny; break; }
@@ -196,7 +234,7 @@ ColorSetup color_setup(const DngInfo& d, bool asShot, double temp, double tint, 
         temp_tint_to_xy(std::clamp(temp, 1500.0, 50000.0), std::clamp(tint, -150.0, 150.0), wx, wy);
         double XYZ[3];
         xy_to_XYZ(wx, wy, XYZ);
-        mulv(color_matrix(d, wx, wy), XYZ, neutral);
+        mulv(color_matrix(cmp, wx, wy), XYZ, neutral);
         for (double& n : neutral) n = std::max(1e-6, n);
     }
     for (double& n : neutral) n = n / neutral[1] * 1.0;
@@ -204,7 +242,7 @@ ColorSetup color_setup(const DngInfo& d, bool asShot, double temp, double tint, 
     for (int i = 0; i < 3; ++i) s.wb[i] = static_cast<float>(1.0 / (neutral[i] / neutral[1]));
     xy_to_temp_tint(wx, wy, s.temp, s.tint);
     // PCS (XYZ D50) -> camera, normalised so D50 white maps to max component 1.
-    Mat3 pcsToCam = mul(color_matrix(d, wx, wy), bradford(d50x, d50y, wx, wy));
+    Mat3 pcsToCam = mul(color_matrix(cmp, wx, wy), bradford(d50x, d50y, wx, wy));
     double d50[3], c[3];
     xy_to_XYZ(d50x, d50y, d50);
     mulv(pcsToCam, d50, c);

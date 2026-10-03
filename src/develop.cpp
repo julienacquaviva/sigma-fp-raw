@@ -127,7 +127,7 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
     double temp = s.colorTemp, tint = s.tint;
     bool asShot = s.whiteBalance == WhiteBalance::AsShot;
     if (!asShot && s.whiteBalance != WhiteBalance::Custom) preset_temp_tint(s.whiteBalance, temp, tint);
-    ColorSetup cs = color_setup(info, asShot, temp, tint, s.colorSpace);
+    ColorSetup cs = color_setup(info, asShot, temp, tint, s.colorSpace, s.cameraMatrix);
     const float norm = std::max({cs.wb[0], cs.wb[1], cs.wb[2]});
     PrepParams pp{};
     pp.W = W; pp.H = H;

@@ -86,9 +86,28 @@ The *Source* line at the top of the panel shows the clip, its frame size, ISO, f
 |---|---|
 | Decode Quality | *Full Res.* (RCD demosaic) or *Half Res.* (2×2 binned, fastest) |
 | White Balance | As Shot, Daylight, Cloudy, Shade, Tungsten, Fluorescent, Flash, Custom. Editing *Color Temp* or *Tint* switches to Custom. |
-| Color Space | Rec.709, P3 D65, Rec.2020, DaVinci Wide Gamut, ACES AP0, ACES AP1 |
+| Camera Matrix | *As Recorded* (the file's ColorMatrix1/2) or *Chart-Fitted (daylight)*: see below |
+| Color Space | Rec.709, P3 D65, Rec.2020, DaVinci Wide Gamut, ACES AP0, ACES AP1, ARRI Wide Gamut 3. AWG3 with Linear gamma feeds a Color Space Transform to LogC3, for ARRI LUTs. |
 | Gamma | Linear, 2.2, 2.4, Rec.709, sRGB, DaVinci Intermediate, ACEScct |
 | Exposure, Sharpness, Highlights, Shadows, Color Boost, Saturation, Midtones, Lift, Gain, Contrast | As in Resolve's CinemaDNG panel: same names, layout and ranges. The response is this plug-in's own, not Blackmagic's. |
+
+**Camera Matrix**
+
+In Color Mode OFF the fp writes a Rec.709 stand-in into ColorMatrix1/2, not a sensor calibration, so
+OFF clips decode at about half chroma; the colour modes carry Sigma's calibration. *Chart-Fitted* swaps in
+a ColorChecker fit of the fp sensor and keeps the camera neutral the file's own matrices give, so White
+Balance, Temp and Tint read exactly as before. Measured through this plug-in (`sfp_cli develop`, Rec.709
+linear, ColorChecker 24, CIEDE2000 mean of the 18 colour patches, white balance as shot):
+
+| Clip | As Recorded | Chart-Fitted |
+|---|---|---|
+| Color Mode OFF | 9.84 | **1.88** |
+| A colour mode (Sigma's calibration) | 6.42 | **1.98** |
+
+Fitted in daylight on one body (FW 5.02). Under tungsten it is the daylight fit, chromatically adapted, not
+yet a measured tungsten matrix. The values live in `src/fp_chart_matrix.h`; `sfp_cli selftest` checks
+white balance, idempotence and the colour, each against a control that must fail. Command line:
+`cam=chart`, `cs=awg3`.
 
 **Stabilisation (gyro)**
 
