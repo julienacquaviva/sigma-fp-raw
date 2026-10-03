@@ -105,7 +105,9 @@ linear, ColorChecker 24, CIEDE2000 mean of the 18 colour patches, white balance 
 | A colour mode (Sigma's calibration) | 6.42 | **1.98** |
 
 Fitted in daylight on one body (FW 5.02). Under tungsten it is the daylight fit, chromatically adapted, not
-yet a measured tungsten matrix. The values live in `src/fp_chart_matrix.h`; `sfp_cli selftest` checks
+yet a measured tungsten matrix: simulated with published fp spectral sensitivities (Solomatov & Akkaynak,
+ICCP 2023), it scores 5.3 there, still half of OFF's 10.3 but no better than Sigma's own tungsten matrix (4.8).
+A tungsten chart fit is next. The values live in `src/fp_chart_matrix.h`; `sfp_cli selftest` checks
 white balance, idempotence and the colour, each against a control that must fail. Command line:
 `cam=chart`, `cs=awg3`.
 
