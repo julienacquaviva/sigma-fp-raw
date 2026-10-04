@@ -20,6 +20,7 @@ struct RawSettings {
     WhiteBalance whiteBalance = WhiteBalance::AsShot;
     double colorTemp = 5600, tint = 0;     // used for presets/custom
     Primaries colorSpace = Primaries::Rec709;
+    CameraMatrix cameraMatrix = CameraMatrix::AsRecorded;
     Gamma gamma = Gamma::Rec709;           // linear toe: no black sparkle (pure 2.4 amplifies noise at 0)
     double exposure = 0;                   // stops, -5..5
     double sharpness = 0;                  // 0..100

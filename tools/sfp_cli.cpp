@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "../src/develop.h"
+#include "../src/fp_chart_matrix.h"
 #include "../src/gyro.h"
 
 using namespace sfp;
@@ -49,7 +50,9 @@ static bool apply(RawSettings& s, const std::string& kv, int& w, int& h, double&
     else if (k == "wb") s.whiteBalance = v == "custom" ? WhiteBalance::Custom : WhiteBalance::AsShot;
     else if (k == "temp") s.colorTemp = d;
     else if (k == "tint") s.tint = d;
+    else if (k == "cam") s.cameraMatrix = v == "chart" ? CameraMatrix::ChartFitted : CameraMatrix::AsRecorded;
     else if (k == "cs") s.colorSpace = v == "p3" ? Primaries::P3D65 : v == "2020" ? Primaries::Rec2020 : v == "dwg" ? Primaries::DaVinciWideGamut
+                                     : v == "awg3" ? Primaries::ArriWideGamut3
                                      : v == "ap0" ? Primaries::ACES_AP0 : v == "ap1" ? Primaries::ACES_AP1 : Primaries::Rec709;
     else if (k == "gamma") s.gamma = v == "lin" ? Gamma::Linear : v == "22" ? Gamma::Gamma22 : v == "709" ? Gamma::Rec709 : v == "srgb" ? Gamma::sRGB
                                    : v == "di" ? Gamma::DaVinciIntermediate : v == "cct" ? Gamma::ACEScct : Gamma::Gamma24;
@@ -251,6 +254,67 @@ static int block_report(const char* path) {
 
 // Develops a synthetic frame on this machine and checks the picture: finite values, a neutral
 // grey stays neutral, half and full resolution agree, and an identity gyro warp changes nothing.
+// Camera Matrix = Chart-Fitted on a Sigma fp Color Mode OFF pair (one body's ColorMatrix1/2, Standard A / D65).
+// Each check comes with a control that must fail, so a check that cannot see an error is caught too.
+static bool colour_selftest() {
+    DngInfo d;
+    const double off1[9] = {1.5596, -0.7398, -0.2399, -1.1733, 2.271, 0.0503, 0.0835, -0.3064, 1.588};
+    const double off2[9] = {1.6, -0.759, -0.2461, -0.9692, 1.876, 0.0415, 0.0345, -0.1267, 0.6567};
+    for (int i = 0; i < 9; ++i) { d.cm1[i] = off1[i]; d.cm2[i] = off2[i]; }
+    d.hasCM1 = d.hasCM2 = true;
+    d.illum1 = 17; d.illum2 = 21;
+    auto neutral_for = [&](const double* cm, double x, double y) {
+        const double w[3] = {x / y, 1.0, (1 - x - y) / y};
+        for (int i = 0; i < 3; ++i) d.neutral[i] = cm[3 * i] * w[0] + cm[3 * i + 1] * w[1] + cm[3 * i + 2] * w[2];
+        for (int i : {0, 2, 1}) d.neutral[i] /= d.neutral[1];
+    };
+    auto maxdiff = [](const float* a, const double* b) {
+        double m = 0;
+        for (int i = 0; i < 9; ++i) m = std::fmax(m, std::fabs(a[i] - b[i]));
+        return m;
+    };
+    bool ok = true;
+    // 1. White balance and Temp/Tint unchanged, at both calibration whites.
+    for (int k = 0; k < 2; ++k) {
+        neutral_for(k ? off2 : off1, kFpChartWhite[k][0], kFpChartWhite[k][1]);
+        ColorSetup a = color_setup(d, true, 0, 0, Primaries::Rec709, CameraMatrix::AsRecorded);
+        ColorSetup c = color_setup(d, true, 0, 0, Primaries::Rec709, CameraMatrix::ChartFitted);
+        double dt = std::fabs(a.temp - c.temp), dn = std::fabs(a.tint - c.tint);
+        bool pass = dt < 2 && dn < 0.2 && std::fabs(a.wb[0] - c.wb[0]) < 1e-5 && std::fabs(a.wb[2] - c.wb[2]) < 1e-5;
+        std::printf("chart matrix %s: as shot %.0f K / %.2f, chart-fitted %.0f K / %.2f  %s\n", k ? "D65 " : "StdA",
+                    a.temp, a.tint, c.temp, c.tint, pass ? "ok" : "FAIL");
+        ok = ok && pass;
+    }
+    // 2. Colour at D65 is the fit (kFpChartTo709); the recorded OFF pair is not (control).
+    neutral_for(off2, 0.3127, 0.3290);
+    double fit = maxdiff(color_setup(d, true, 0, 0, Primaries::Rec709, CameraMatrix::ChartFitted).matrix, kFpChartTo709);
+    double rec = maxdiff(color_setup(d, true, 0, 0, Primaries::Rec709, CameraMatrix::AsRecorded).matrix, kFpChartTo709);
+    std::printf("chart matrix colour: chart-fitted vs fit %.5f %s, as recorded vs fit %.3f %s\n", fit, fit < 1e-3 ? "ok" : "FAIL",
+                rec, rec > 0.1 ? "(control caught)" : "(control MISSED)");
+    ok = ok && fit < 1e-3 && rec > 0.1;
+    // 3. Idempotent: a file that already carries the chart pair decodes the same either way.
+    CmPair once = chart_fitted_matrices(recorded_matrices(d)), twice = chart_fitted_matrices(once);
+    double idem = 0;
+    for (int i = 0; i < 9; ++i) idem = std::fmax(idem, std::fmax(std::fabs(once.c1.m[i] - twice.c1.m[i]), std::fabs(once.c2.m[i] - twice.c2.m[i])));
+    CmPair recorded = recorded_matrices(d);
+    double moved = 0;
+    for (int i = 0; i < 9; ++i) moved = std::fmax(moved, std::fabs(once.c2.m[i] - recorded.c2.m[i]));
+    std::printf("chart matrix idempotent: %.2e %s, recorded -> chart-fitted moves %.3f %s\n", idem, idem < 1e-9 ? "ok" : "FAIL",
+                moved, moved > 0.1 ? "(control caught)" : "(control MISSED)");
+    ok = ok && idem < 1e-9 && moved > 0.1;
+    // 4. ARRI Wide Gamut 3: luminance row against ARRI's published AWG3 -> XYZ; grey stays grey.
+    ColorSetup g = color_setup(d, true, 0, 0, Primaries::ArriWideGamut3, CameraMatrix::ChartFitted);
+    const double arriY[3] = {0.291954, 0.823841, -0.115795};
+    double dy = 0, grey = 0;
+    for (int i = 0; i < 3; ++i) {
+        dy = std::fmax(dy, std::fabs(g.lum[i] - arriY[i]));
+        grey = std::fmax(grey, std::fabs(g.matrix[3 * i] + g.matrix[3 * i + 1] + g.matrix[3 * i + 2] - 1.0));
+    }
+    std::printf("AWG3: Y row vs ARRI %.5f %s, grey %.5f %s\n", dy, dy < 1e-3 ? "ok" : "FAIL", grey, grey < 1e-3 ? "ok" : "FAIL");
+    ok = ok && dy < 1e-3 && grey < 1e-3;
+    return ok;
+}
+
 static int selftest(const char* fpg) {
     const int W = 640, H = 480;
     Frame f;
@@ -318,6 +382,7 @@ static int selftest(const char* fpg) {
             if (clip->frames() < 1) ok = false;
         }
     }
+    ok = colour_selftest() && ok;
     std::puts(ok ? "PASS" : "FAIL");
     std::fflush(stdout);
     std::_Exit(ok ? 0 : 1);
