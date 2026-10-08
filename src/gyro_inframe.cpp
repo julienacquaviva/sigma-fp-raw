@@ -96,6 +96,10 @@ bool parse_fpg2(const uint8_t* d, size_t size, GyroBlock& out, std::string* why)
     out.resolution = d[38]; out.dcCrop = d[39]; out.bitDepth = d[40];
     for (int i = 0; i < 3; ++i) out.axis[i] = static_cast<int8_t>(d[42 + i]);
     out.lsb = rd16(d + 46);
+    if (size >= 3064) {
+        out.windowW = rd16(d + 3056); out.windowH = rd16(d + 3058);
+        out.recordedW = rd16(d + 3060); out.recordedH = rd16(d + 3062);
+    }
     out.samples.resize(3 * n);
     for (size_t i = 0; i < 3 * n; ++i) out.samples[i] = static_cast<int16_t>(rd16(d + header + 2 * i));
     out.present = true;
@@ -232,6 +236,7 @@ std::shared_ptr<GyroClip> GyroClip::from_blocks(const std::vector<GyroBlock>& bl
     h.preroll = static_cast<uint32_t>(after[0]);
     h.pitchNm = 0;
     h.resolution = b0.resolution; h.dcCrop = b0.dcCrop; h.bitDepth = b0.bitDepth; h.sensorMode = b0.sensorMode;
+    window_for(b0.dcCrop, b0.windowW, b0.windowH, b0.recordedW, b0.recordedH, b0.readoutUs, h);
 
     // Frame table: the count at each frame's mark. A frame without a block between two blocks
     // whose samples are all there (they are in the next block's slice) gets its mark by
@@ -379,7 +384,7 @@ std::string cache_path(const std::string& key) {
     return dir + os::kSep + name;
 }
 
-const uint32_t kCacheVersion = 2;
+const uint32_t kCacheVersion = 3;
 
 template <class T> void put(std::vector<uint8_t>& o, const T& v) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
@@ -576,6 +581,11 @@ void scan(std::shared_ptr<Entry> e, std::string dngPath) {
 
 }  // namespace
 
+bool dng_geometry(const std::string& dngPath, ClipGeometry& geo) {
+    std::string err;
+    return clip_geometry(dngPath, geo, err);
+}
+
 GyroLoad inframe_gyro(const std::string& dngPath) {
     std::string prefix, suffix, key = dngPath;
     long long number = 0;
@@ -696,6 +706,32 @@ double scan_blocks(const std::string& dngPath, long long& count, long long& foun
     count = static_cast<long long>(files.size());
     found = hits;
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+int frame_binning(const std::string& dngPath, int rasterW, int rasterH, std::string& why) {
+    if (!(rasterW == 3024 && rasterH == 2010)) { why = "not a 3K frame"; return 0; }
+    std::string prefix, suffix, key = dngPath;
+    long long number = 0;
+    int digits = 0;
+    if (split_sequence(dngPath, prefix, number, digits, suffix)) key = prefix;
+    static std::mutex m;
+    static std::map<std::string, std::pair<int, std::string>> seen;
+    {
+        std::lock_guard<std::mutex> l(m);
+        auto it = seen.find(key);
+        if (it != seen.end()) { why = it->second.second; return it->second.first; }
+    }
+    GyroBlock b;
+    int r;
+    if (!read_fpg2(dngPath, b)) { r = -1; why = "3K frame, no gyro block: taken as the 2x2 binned readout"; }
+    else if (b.windowW > 0) { r = 0; why = "1:1 sensor window (R124)"; }
+    else if (b.dcCrop == 2) { r = 0; why = "1:1 sensor window (MQ 50, crop code 2)"; }
+    else if (b.readoutUs == 18926) { r = 0; why = "1:1 sensor window (MQ 50, R122 readout)"; }
+    else { r = 1; why = "2x2 binned readout (M98)"; }
+    std::lock_guard<std::mutex> l(m);
+    if (seen.size() > 256) seen.clear();
+    seen[key] = {r, why};
+    return r;
 }
 
 void gyro_shutdown() {

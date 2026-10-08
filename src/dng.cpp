@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <cstring>
@@ -71,6 +72,52 @@ bool read_ifd(const Reader& r, size_t off, std::vector<Entry>& out) {
 }
 
 }  // namespace
+
+void apply_shading(const DngInfo& info, const GainMap& g, uint16_t* raw, double fracW, double fracH) {
+    if (!g.valid()) return;
+    const int W = info.width, H = info.height;
+    const int ax = info.activeLeft + info.cropX, ay = info.activeTop + info.cropY;
+    fracW = std::clamp(fracW, 0.05, 1.0);
+    fracH = std::clamp(fracH, 0.05, 1.0);
+    // Map column of every raster column (the map's grid spans the picture, edge to edge).
+    std::vector<int> j0(W);
+    std::vector<float> fb(W);
+    for (int x = 0; x < W; ++x) {
+        const double u = std::clamp((x - ax + 0.5) / info.cropW, 0.0, 1.0);
+        const double m = (0.5 + (u - 0.5) * fracW) * (g.cols - 1);
+        j0[x] = std::min(static_cast<int>(m), g.cols - 2);
+        fb[x] = static_cast<float>(m - j0[x]);
+    }
+    const int white = static_cast<int>(info.white);
+    std::vector<float> row[2];
+    for (int y = 0; y < H; ++y) {
+        const double v = std::clamp((y - ay + 0.5) / info.cropH, 0.0, 1.0);
+        const double m = (0.5 + (v - 0.5) * fracH) * (g.rows - 1);
+        const int i0 = std::min(static_cast<int>(m), g.rows - 2);
+        const float fa = static_cast<float>(m - i0);
+        // The map's row for the two colours of this raster row.
+        float black[2];
+        for (int par = 0; par < 2; ++par) {
+            const int k = ((y & 1) << 1) | par;
+            const int plane = g.planes == 3 ? info.cfa[k] : 0;
+            black[par] = info.black[k];
+            row[par].resize(g.cols);
+            const float* a = &g.gain[(static_cast<size_t>(i0) * g.cols) * g.planes + plane];
+            const float* b = a + static_cast<size_t>(g.cols) * g.planes;
+            for (int j = 0; j < g.cols; ++j) row[par][j] = a[j * g.planes] + fa * (b[j * g.planes] - a[j * g.planes]);
+        }
+        uint16_t* px = raw + static_cast<size_t>(y) * W;
+        for (int x = 0; x < W; ++x) {
+            const int c = px[x];
+            if (c >= white) continue;
+            const int par = x & 1;
+            const float* r = row[par].data() + j0[x];
+            const float gain = r[0] + fb[x] * (r[1] - r[0]);
+            const float out = black[par] + (c - black[par]) * gain + 0.5f;
+            px[x] = static_cast<uint16_t>(out < 0.f ? 0.f : out > 65535.f ? 65535.f : out);
+        }
+    }
+}
 
 bool read_file(const std::string& path, std::vector<uint8_t>& data, std::string& error) {
 #ifdef _WIN32
@@ -197,6 +244,63 @@ bool parse_dng(const uint8_t* data, size_t size, DngInfo& info, std::string& err
     if (auto n = find(ifd0, 0xC628); n && n->count == 3) for (int i = 0; i < 3; ++i) info.neutral[i] = value(r, *n, i);
     if (auto a = find(ifd0, 0xC627); a && a->count == 3) for (int i = 0; i < 3; ++i) info.analog[i] = value(r, *a, i);
     info.baselineExposure = num(ifd0, 0xC62A, 0);
+    info.focalMm = num(exif, 0x920A, 0);
+    info.fNumber = num(exif, 0x829D, 0);
+    info.focusM = num(exif, 0x9206, 0);
+    if (auto l = find(exif, 0xA434); l && l->type == 2) {
+        info.lensModel.assign(reinterpret_cast<const char*>(data + l->at), l->count);
+        info.lensModel = info.lensModel.c_str();
+        while (!info.lensModel.empty() && info.lensModel.back() == ' ') info.lensModel.pop_back();
+    }
+    // Opcode lists: big-endian opcodes; WarpRectilinear is id 1, GainMap is id 9. Video frames
+    // carry both in OpcodeList3; stills keep the vignette's GainMap in OpcodeList2.
+    for (uint16_t list : {uint16_t(0xC74E), uint16_t(0xC741)}) {
+        auto o = find(raw, list) ? find(raw, list) : find(ifd0, list);
+        if (!o || o->count < 4) continue;
+        const Reader b{data + o->at, o->count, false};
+        auto f32 = [&](size_t at) { float f; uint32_t v = b.u32(at); std::memcpy(&f, &v, 4); return f; };
+        auto f64 = [&](size_t at) { double f; uint64_t v = static_cast<uint64_t>(b.u32(at)) << 32 | b.u32(at + 4); std::memcpy(&f, &v, 8); return f; };
+        size_t at = 4;
+        for (uint32_t k = 0, n = b.u32(0); k < n && b.ok(at, 16); ++k) {
+            const uint32_t id = b.u32(at), bytes = b.u32(at + 12);
+            const size_t body = at + 16;
+            if (!b.ok(body, bytes)) break;
+            at = body + bytes;
+            if (id == 1 && bytes >= 4 && !info.warp.valid) {
+                const uint32_t planes = b.u32(body);
+                if ((planes == 1 || planes == 3) && bytes >= 4 + 48 * planes + 16) {
+                    const size_t at0 = body + 4 + 48 * (planes == 3 ? 1 : 0);
+                    LensWarp w;
+                    for (int i = 0; i < 4; ++i) w.c[2 * i] = f64(at0 + 8 * i);   // terms in r^0, r^2, r^4, r^6
+                    w.cx = f64(body + 4 + 48 * planes);
+                    w.cy = f64(body + 4 + 48 * planes + 8);
+                    bool sane = w.c[0] > 0.5 && w.c[0] < 2 && w.cx > 0.2 && w.cx < 0.8 && w.cy > 0.2 && w.cy < 0.8;
+                    for (int i = 1; i < 4; ++i) sane = sane && std::fabs(w.c[2 * i]) < 2;
+                    w.valid = sane;
+                    if (sane) info.warp = w;
+                }
+                continue;
+            }
+            if (id != 9 || bytes < 76 || info.shading.valid()) continue;
+            GainMap g;
+            g.areaH = static_cast<int>(b.u32(body + 8)) - static_cast<int>(b.u32(body));
+            g.areaW = static_cast<int>(b.u32(body + 12)) - static_cast<int>(b.u32(body + 4));
+            g.rows = static_cast<int>(b.u32(body + 32));
+            g.cols = static_cast<int>(b.u32(body + 36));
+            g.planes = static_cast<int>(b.u32(body + 72));
+            // Only what the fp writes: every pixel (pitch 1), the map spread over the whole area.
+            const bool whole = b.u32(body + 24) == 1 && b.u32(body + 28) == 1;
+            const size_t count = static_cast<size_t>(std::max(0, g.rows)) * std::max(0, g.cols) * std::max(0, g.planes);
+            if (!whole || !g.valid() || g.rows > 512 || g.cols > 512 || bytes < 76 + 4 * count) continue;
+            g.gain.resize(count);
+            bool sane = true;
+            for (size_t i = 0; i < count; ++i) {
+                g.gain[i] = f32(body + 76 + 4 * i);
+                if (!(g.gain[i] > 0.05f && g.gain[i] < 20.f)) sane = false;
+            }
+            if (sane) info.shading = std::move(g);
+        }
+    }
     info.iso = static_cast<int>(num(exif, 0x8827, num(ifd0, 0x8827, 0)));
     info.fps = num(ifd0, 0xC764, 0);
     if (auto m = find(ifd0, 0xC614)) info.model.assign(reinterpret_cast<const char*>(data + m->at), strnlen(reinterpret_cast<const char*>(data + m->at), m->count));

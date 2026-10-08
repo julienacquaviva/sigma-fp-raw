@@ -22,6 +22,7 @@
 
 #include "develop.h"
 #include "gyro.h"
+#include "lens_profile.h"
 #include "platform.h"
 
 // CUDA rendering (ofxGPURender.h) and DaVinci Resolve's additions to OpenFX (its ofxImageEffectExt.h):
@@ -46,6 +47,10 @@
 #endif
 #ifndef kOfxImageEffectPropSrcFrame
 #define kOfxImageEffectPropSrcFrame "OfxImageEffectPropSrcFrame"
+#endif
+
+#ifndef SFP_VERSION
+#define SFP_VERSION "dev"
 #endif
 
 using namespace sfp;
@@ -83,6 +88,14 @@ struct Instance {
     double hostOffset = 0;            // source frame (0-based) minus effect time
     double hostFirst = 0, hostLast = 0;   // frame range of the source clip in effect time
     std::string hostSource;           // clip the above belongs to
+    // The frame the host asked for at the last render and its project (timeline) frame, in
+    // render-scaled pixels; 0 = not known yet. For the Clip Info block.
+    int lastRodW = 0, lastRodH = 0;
+    double lastProjW = 0, lastProjH = 0;
+    // EXIF of the first frame (0 = unknown).
+    double exposureS = 0, exifFocalMm = 0;
+    int windowW = 0, windowH = 0;     // sensor window, from the first frame's gyro block (0 = none)
+    OfxPropertySetHandle zoomSmoothProps = nullptr;   // to grey Smoothness (zoom) out while Zoom Mode is Fixed
 };
 
 OfxPropertySetHandle effect_props(OfxImageEffectHandle h) {
@@ -195,8 +208,44 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     OfxPropertySetHandle page = nullptr;
     gParam->paramDefine(ps, kOfxParamTypePage, "Controls", &page);
     Definer d{ps, page};
-    d.label("info", "Source", nullptr, "Clip, frame format and as-shot metadata of the original DNG.");
-    d.group("raw", "Camera RAW", true, "Development controls (Resolve CinemaDNG panel layout); the native Camera RAW panel is bypassed.");
+    d.group("clipInfo", "Clip Info (v" SFP_VERSION ")", true, "What the clip was shot with and how it is framed. Refreshes when the node is created and when a control is changed.");
+    d.label("info", "Clip", "clipInfo", "First DNG of the clip.");
+    d.label("infoExposure", "Exposure", "clipInfo", "Shutter speed, shutter angle, ISO and frame rate.");
+    d.label("infoFormat", "Format", "clipInfo", "Aspect ratio, bit depth, the sensor window that was read and the recorded (scaled) resolution.");
+    d.label("infoLens", "Lens", "clipInfo",
+            "Focal length and crop factor against full frame at the current frame: sensor window, fit, Transform zoom and the stabiliser's zoom "
+            "(rolling-shutter correction included). Refreshes when a control is changed, not during playback.");
+    // Framing: the fit, then a transform like DaVinci Resolve's Transform panel. Both are part of the
+    // one resampling that also stabilises, from the full-resolution developed picture.
+    d.group("xform", "Transform", false, "Zoom, position, rotation, anchor, pitch, yaw and flip, applied in the same single resampling as the "
+                                         "fit and the stabilisation (no second resampling). Same controls and units as Resolve's Transform.");
+    const char* fits[] = {"Scale to Fit", "Fit Width", "Fit Height"};
+    d.choice("fitMode", "Fit", fits, 3, 0, "xform",
+             "How the picture maps onto the timeline frame before the Transform. Scale to Fit: the whole picture, as Resolve's input "
+             "scaling does. Fit Width / Fit Height: the width / the height fills the timeline frame. A Transform zoom of 1 is this exact fit.");
+    d.number("xfZoomX", "Zoom X", 1, 0, 100, 0, 4, "xform", "Horizontal zoom about the anchor point; 1 = the fit.", 3);
+    d.number("xfZoomY", "Zoom Y", 1, 0, 100, 0, 4, "xform", "Vertical zoom about the anchor point; follows Zoom X while Link Zoom is on.", 3);
+    d.toggle("xfZoomLink", "Link Zoom", true, "xform", "Zoom Y follows Zoom X.");
+    d.number("xfPosX", "Position X", 0, -100000, 100000, -4000, 4000, "xform", "Timeline pixels; positive moves the picture right.", 3);
+    d.number("xfPosY", "Position Y", 0, -100000, 100000, -4000, 4000, "xform", "Timeline pixels; positive moves the picture up.", 3);
+    d.number("xfRotation", "Rotation Angle", 0, -360, 360, -360, 360, "xform", "Degrees about the anchor point; positive turns the picture anticlockwise.", 3);
+    d.number("xfAnchorX", "Anchor Point X", 0, -100000, 100000, -4000, 4000, "xform", "Timeline pixels from the frame centre: the point zoom and rotation turn about.", 3);
+    d.number("xfAnchorY", "Anchor Point Y", 0, -100000, 100000, -4000, 4000, "xform", "Timeline pixels from the frame centre, up positive.", 3);
+    d.number("xfPitch", "Pitch", 0, -89, 89, -89, 89, "xform", "Degrees: the picture tilted about its horizontal axis, in perspective (positive leans the top away).", 3);
+    d.number("xfYaw", "Yaw", 0, -89, 89, -89, 89, "xform", "Degrees: the picture turned about its vertical axis, in perspective (positive turns the right side away).", 3);
+    d.toggle("xfFlipH", "Flip Horizontal", false, "xform", "Mirror left and right.");
+    d.toggle("xfFlipV", "Flip Vertical", false, "xform", "Mirror top and bottom.");
+    d.group("raw", "Camera RAW", false, "Development controls (Resolve CinemaDNG panel layout); the native Camera RAW panel is bypassed.");
+    d.toggle("developRaw", "Develop RAW", false, "raw",
+             "On: the plug-in develops the original DNG frames itself, with the controls below. Off: the picture and the colour stay Resolve's own "
+             "(its Camera RAW settings, your colour pipeline and PowerGrades as without the plug-in); the plug-in then only does the Transform, the "
+             "stabilisation and the lens corrections on that picture. Off costs some sharpness (Resolve's picture at the timeline resolution is "
+             "resampled once more); the vignette correction then needs Resolve Gamma set, and the controls below it do nothing.");
+    const char* sg[] = {"Linear", "Gamma 2.2", "Gamma 2.4", "Gamma 2.6", "Rec.709", "sRGB", "Blackmagic Design Film", "Blackmagic Design 4K Film",
+                        "Blackmagic Design 4.6K Film", "DaVinci Intermediate", "ACEScct"};
+    d.choice("sourceGamma", "Resolve Gamma", sg, 11, 4, "raw",
+             "Develop RAW off only, for the Vignette Correction: the Gamma set in Resolve's own Camera RAW panel for this clip. The vignette is removed in "
+             "linear light, so the plug-in has to know how Resolve's picture is encoded. A wrong choice makes the corners too bright or too dark.");
     const char* dq[] = {"Full Res. (RCD)", "Half Res."};
     d.choice("decodeQuality", "Decode Quality", dq, 2, 0, "raw", "Full: RCD demosaic at full resolution. Half: 2x2 binned, fastest.");
     d.choice("whiteBalance", "White Balance", WB_OPTIONS, 8, 0, "raw", "As Shot uses the camera's AsShotNeutral. Editing Color Temp or Tint switches to Custom.");
@@ -234,11 +283,34 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     const char* fit[] = {"Scale to Fit", "Fill", "Stretch", "Native 1:1"};
     d.choice("fit", "Image Fit", fit, 4, 0, nullptr, "How the DNG crop maps onto the timeline frame (Resolve's default input scaling is Scale to Fit).");
     d.hide();
-    d.group("stab", "Stabilisation (gyro)", true,
+    // Hidden: the kernel of the resampling. Best (Lanczos-3, widened when the picture is made
+    // smaller) plays in real time; Fast (bilinear, as before 1.5.1) is kept for comparison.
+    const char* resamplers[] = {"Best (Lanczos-3)", "Fast (bilinear)"};
+    d.choice("resampling", "Resampling", resamplers, 2, 0, nullptr, "The kernel of the single resampling: Best (Lanczos-3) or Fast (bilinear).");
+    d.hide();
+    d.group("lens", "Lens Correction", false,
+            "Corrections from the lens's own profile, which the camera writes into every frame. The Correction line says what the clip carries.");
+    d.label("infoCorrection", "Correction", "lens", "What each of the two corrections uses for this clip: the picked file, the lens's own profile from the camera, or the installed Adobe profile.");
+    d.toggle("lensShading", "Vignette Correction", false, "lens",
+             "Removes the lens's vignette and colour shading. The vignette is only in the frames when the camera's Vignetting compensation "
+             "was set to Auto. Applied to the raw data, before everything else.");
+    d.toggle("lensDistortion", "Distortion Correction", false, "lens",
+             "Straightens the lens's distortion, in the same single resampling as the fit, the Transform and the stabilisation "
+             "(which then works on the straightened picture).");
+    const char* fileHint = "Leave empty: the lens's own profile from the clip is used, and when the clip has none, the Adobe lens profile installed on "
+                           "this computer for that lens. Or pick a profile file to use instead: a DNG shot with the same lens (a clip frame or a still), "
+                           "an Adobe lens profile (.lcp) or a Lensfun file (.xml). The Correction line says what is used.";
+    for (const char* const* f : {(const char* const[]){"lensShadingFile", "Vignette Profile"}, (const char* const[]){"lensDistortionFile", "Distortion Profile"}}) {
+        auto p = d.define(kOfxParamTypeString, f[0], f[1], fileHint, "lens");
+        set_s(p, kOfxParamPropStringMode, kOfxParamStringIsFilePath);
+        set_s(p, kOfxParamPropDefault, "");
+        set_i(p, kOfxParamPropAnimates, 0);
+    }
+    d.group("stab", "Stabilisation (gyro)", false,
             "Gyro stabilisation from the camera's gyro data: inside the DNG frames, or the <clip>.FPG file next to them. Found automatically; without gyro data this group does nothing.");
     d.label("stabStatus", "Gyro", "stab", "Gyro data in use (frames, sample rate, focal length, zoom), loading progress, or why stabilisation is off. Refreshes when a control is changed.");
-    d.toggle("stabEnable", "Stabilisation", true, "stab", "Stabilise with the camera's gyro data when the clip has an .FPG file.");
-    d.number("stabSmoothness", "Smoothness", 0.5, 0, 30, 0, 3, "stab",
+    d.toggle("stabEnable", "Stabilisation", false, "stab", "Stabilise with the camera's gyro data (inside the DNG frames, or an .FPG file). Off by default.");
+    d.number("stabSmoothness", "Smoothness", 0.1, 0, 30, 0, 3, "stab",
              "Time constant in seconds of the camera-path smoothing. 0 follows the camera (rolling-shutter correction only); large values lock the shot. More smoothing needs more zoom.");
     d.number("stabRollingShutter", "Rolling Shutter Correction", 1, 0, 1, 0, 1, "stab",
              "1 corrects each sensor row for the time it was read; 0 treats the frame as one instant.");
@@ -263,10 +335,10 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     d.number("stabRangeStart", "Range Start (frame)", 1, 1, 10000000, 1, 10000, "stab", "Manual range: first source frame (the number in the DNG file name).", 0);
     d.number("stabRangeEnd", "Range End (frame)", 0, 0, 10000000, 0, 10000, "stab", "Manual range: last source frame (the number in the DNG file name); 0 = to the end of the clip.", 0);
     const char* zmodes[] = {"Fixed", "Dynamic"};
-    d.choice("stabZoomMode", "Zoom Mode", zmodes, 2, 0, "stab",
+    d.choice("stabZoomMode", "Zoom Mode", zmodes, 2, 1, "stab",
              "Fixed: one zoom for the whole range. Dynamic: the zoom follows what each part needs and changes slowly, so a shaky section costs zoom only near itself.");
-    d.number("stabZoomSmooth", "Dynamic Zoom Smoothness", 4, 0.2, 30, 0.5, 10, "stab",
-             "Seconds over which the dynamic zoom looks ahead and eases. Larger = slower zoom changes, but more zoom around a shaky section.", 1);
+    d.number("stabZoomSmooth", "Smoothness", 4, 0.2, 30, 0.5, 10, "stab",
+             "Zoom Mode Dynamic only (greyed out otherwise). Seconds over which the dynamic zoom looks ahead and eases. Larger = slower zoom changes, but more zoom around a shaky section.", 1);
     d.number("stabMaxZoom", "Auto Zoom Limit", 1.3, 1, 4, 1, 2, "stab",
              "Largest automatic zoom. Frames that would need more (violent moves) are stabilised less instead, so one jolt does not zoom the whole clip.", 2);
     d.number("stabZoom", "Zoom", 1, 0.5, 4, 0.8, 2, "stab", "Manual zoom, multiplies the automatic zoom.", 3);
@@ -275,6 +347,7 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
         set_s(p, kOfxParamPropStringMode, kOfxParamStringIsFilePath);
         set_s(p, kOfxParamPropDefault, "");
         set_i(p, kOfxParamPropAnimates, 0);
+        set_i(p, kOfxParamPropSecret, 1);   // hidden since v1.6: kept for projects that set it
     }
     // Hidden since v1.3.2, without a group: First DNG File (empty), Frame Mapping (Resolve Source Frame), Timeline Anchor (0).
     {
@@ -336,7 +409,23 @@ RawSettings settings(Instance& in, double t) {
     s.softClip = ival(in, "softClip", t) != 0;
     s.rowPhase = dval(in, "rowPhase", t);
     s.deZigzag = dval(in, "deZigzag", t);
-    s.fit = static_cast<Fit>(std::clamp(ival(in, "fit", t), 0, 3));
+    s.fit = static_cast<Fit>(std::clamp(ival(in, "fit", t), 0, 3));   // hidden since 1.3.2: what older projects stored
+    const int fitMode = ival(in, "fitMode", t);
+    if (fitMode == 1) s.fit = Fit::FitWidth;
+    else if (fitMode == 2) s.fit = Fit::FitHeight;
+    s.resampler = ival(in, "resampling", t) == 1 ? kResampleBilinear : kResampleLanczos3;
+    s.lensDistortion = ival(in, "lensDistortion", t) != 0;
+    s.xf.zoomX = dval(in, "xfZoomX", t);
+    s.xf.zoomY = ival(in, "xfZoomLink", t) ? s.xf.zoomX : dval(in, "xfZoomY", t);
+    s.xf.posX = dval(in, "xfPosX", t);
+    s.xf.posY = dval(in, "xfPosY", t);
+    s.xf.rotation = dval(in, "xfRotation", t);
+    s.xf.anchorX = dval(in, "xfAnchorX", t);
+    s.xf.anchorY = dval(in, "xfAnchorY", t);
+    s.xf.pitch = dval(in, "xfPitch", t);
+    s.xf.yaw = dval(in, "xfYaw", t);
+    s.xf.flipH = ival(in, "xfFlipH", t) != 0;
+    s.xf.flipV = ival(in, "xfFlipV", t) != 0;
     return s;
 }
 
@@ -437,13 +526,114 @@ void sync_metadata(Instance& in, bool force) {
     }
     in.meta = info;
     in.haveMeta = true;
-    ColorSetup cs = color_setup(info, true, 0, 0, Primaries::Rec709);
-    std::string name = path.substr(path.find_last_of("/\\") + 1);
+    in.exposureS = in.exifFocalMm = 0;
+    {
+        ClipGeometry geo;
+        if (dng_geometry(path, geo)) { in.exposureS = geo.exposureS; in.exifFocalMm = geo.focalMm; }
+        // The sensor window is in the first frame's own gyro block: no need to wait for the clip's scan.
+        in.windowW = in.windowH = 0;
+        GyroBlock b;
+        if (read_fpg2(path, b)) {
+            GyroHeader gh;
+            gh.activeW = info.cropW; gh.activeH = info.cropH;
+            window_for(b.dcCrop, b.windowW, b.windowH, b.recordedW, b.recordedH, b.readoutUs, gh);
+            in.windowW = gh.windowW; in.windowH = gh.windowH;
+        }
+    }
+    gParam->paramSetValue(in.params.at("info"), path.substr(path.find_last_of("/\\") + 1).c_str());
+}
+
+// "3:2", "16:9", ... for a frame size, or "1.85:1".
+std::string ratio_name(int w, int h) {
+    if (w <= 0 || h <= 0) return "?";
+    const double r = static_cast<double>(w) / h;
+    static const struct { double r; const char* name; } known[] = {
+        {1.0, "1:1"}, {4.0 / 3, "4:3"}, {1.5, "3:2"}, {16.0 / 9, "16:9"}, {256.0 / 135, "17:9"}, {2.0, "2:1"}, {2.39, "2.39:1"}, {2.4, "2.4:1"}};
+    for (const auto& k : known)
+        if (std::fabs(r / k.r - 1) < 0.006) return k.name;
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.2f:1", r);
+    return buf;
+}
+
+// The rows of the Clip Info block below the first (outside render). clip and warp: the gyro
+// data of the clip and the warp of the current frame, as gyro_for_frame gave them.
+void sync_info(Instance& in, double t, const std::shared_ptr<const GyroClip>& clip, const StabParams& warp) {
+    std::string exposure = "-", format = "-", lens = "-", correction = "-";
     char buf[512];
-    std::snprintf(buf, sizeof buf, "%s | %dx%d -> %dx%d | ISO %d | %.3f fps | as shot %.0fK %+.0f | %s",
-                  name.c_str(), info.width, info.height, info.cropW, info.cropH, info.iso, info.fps, cs.temp, cs.tint,
-                  info.width == 3024 && info.height == 2010 ? "3K (M98): Row Phase + Edge Anti-aliasing active" : "not 3K: Row Phase / Anti-aliasing inactive");
-    gParam->paramSetValue(in.params.at("info"), buf);
+    if (in.haveMeta) {
+        const DngInfo& m = in.meta;
+        int rodW, rodH;
+        double projW, projH;
+        {
+            std::lock_guard<std::mutex> l(in.rangeM);
+            rodW = in.lastRodW; rodH = in.lastRodH; projW = in.lastProjW; projH = in.lastProjH;
+        }
+        // Exposure: shutter speed, angle, ISO, frame rate.
+        std::string shutter = "shutter unknown";
+        if (in.exposureS > 0) {
+            const double d = 1.0 / in.exposureS;
+            if (in.exposureS >= 0.5) std::snprintf(buf, sizeof buf, "%.1f s", in.exposureS);
+            else if (std::fabs(d - std::round(d)) < 0.05) std::snprintf(buf, sizeof buf, "1/%.0f s", d);
+            else std::snprintf(buf, sizeof buf, "1/%.1f s", d);
+            shutter = buf;
+            if (m.fps > 0) {
+                std::snprintf(buf, sizeof buf, " | %.1f\xC2\xB0", 360.0 * in.exposureS * m.fps);
+                shutter += buf;
+            }
+        }
+        std::snprintf(buf, sizeof buf, "%s | ISO %d | %.3f fps", shutter.c_str(), m.iso, m.fps);
+        exposure = buf;
+        // Format: ratio, bit depth, sensor window, recorded size.
+        const int windowW = clip && clip->h.windowW > 0 ? clip->h.windowW : in.windowW, windowH = clip && clip->h.windowW > 0 ? clip->h.windowH : in.windowH;
+        if (windowW > 0 && windowH > 0)
+            std::snprintf(buf, sizeof buf, "%s | %d-bit | sensor %dx%d > %dx%d", ratio_name(m.cropW, m.cropH).c_str(), m.bps, windowW, windowH, m.cropW, m.cropH);
+        else
+            std::snprintf(buf, sizeof buf, "%s | %d-bit | %dx%d (sensor window unknown)", ratio_name(m.cropW, m.cropH).c_str(), m.bps, m.cropW, m.cropH);
+        format = buf;
+        // Lens: focal length and the crop factor of what is seen across the frame's width.
+        const bool override = !ival(in, "stabFocalAuto", t) && dval(in, "stabFocal", t) > 0;
+        const double focal = override ? dval(in, "stabFocal", t) : clip && clip->h.focalMm > 0 ? clip->h.focalMm : in.exifFocalMm;
+        if (focal > 0) std::snprintf(buf, sizeof buf, "%.1f mm%s", focal, override ? " (override)" : "");
+        else std::snprintf(buf, sizeof buf, "focal length unknown");
+        lens = buf;
+        if (windowW > 0) {
+            // Share of the recorded width that the frame shows: the fit, the Transform zoom, the stabiliser's zoom.
+            const RawSettings s = settings(in, t);
+            const double a = static_cast<double>(m.cropW) / std::max(1, m.cropH);
+            const double c = projW > 0 && projH > 0 ? projW / projH : rodW > 0 && rodH > 0 ? static_cast<double>(rodW) / rodH : a;
+            double zoom = 1;
+            if (s.fit == Fit::FitHeight || s.fit == Fit::Fill) zoom = std::max(1.0, a / c);
+            zoom *= std::fabs(s.xf.zoomX);
+            const double stab = warp.on && warp.invZoom > 0 ? 1.0 / warp.invZoom : 1.0;
+            zoom = std::max(1.0, zoom * stab);
+            // Against the widest window the camera reads (6048 px, its 3:2 full-frame mode = 1.00x).
+            const double crop = std::max(6048.0, static_cast<double>(windowW)) / windowW * zoom;
+            std::snprintf(buf, sizeof buf, " | crop %.2fx", crop);
+            lens += buf;
+            if (focal > 0) { std::snprintf(buf, sizeof buf, " (= %.0f mm full frame)", focal * crop); lens += buf; }
+        }
+        // What each of the two corrections uses: the picked file, else what the frames carry, else the installed Adobe profile.
+        std::string note;
+        GainMap map;
+        LensWarp warp;
+        bool ownColour = true;
+        if (!ival(in, "lensShading", t)) correction = "vignette: off";
+        else {
+            const bool have = lens_vignette(sval(in, "lensShadingFile"), m, map, ownColour, note);
+            correction = "vignette: " + note;
+            if (have && !ival(in, "developRaw", t)) correction += " (brightness only, on Resolve's picture)";
+        }
+        if (!ival(in, "lensDistortion", t)) correction += " | distortion: off";
+        else { lens_distortion(sval(in, "lensDistortionFile"), m, warp, note); correction += " | distortion: " + note; }
+    }
+    const char* rows[4] = {"infoExposure", "infoFormat", "infoLens", "infoCorrection"};
+    const std::string* text[4] = {&exposure, &format, &lens, &correction};
+    const bool was = in.updating;
+    in.updating = true;
+    for (int k = 0; k < 4; ++k)
+        if (sval(in, rows[k]) != *text[k]) gParam->paramSetValue(in.params.at(rows[k]), text[k]->c_str());
+    in.updating = was;
 }
 
 // Shows which gyro file the clip uses, or why stabilisation is off (outside render).
@@ -451,13 +641,19 @@ void sync_stab_status(Instance& in, double t) {
     std::string status;
     std::shared_ptr<const GyroClip> clip;
     std::string path = source_path(in);
+    StabParams warp{};
+    // The source frame shown at time t, as far as the last render told.
+    long long frame = 0;
+    {
+        std::lock_guard<std::mutex> l(in.rangeM);
+        if (in.hostKnown) frame = std::max(0LL, std::llround(t + in.hostOffset));
+    }
     if (path.empty() || !is_dng(path)) status = "Off: no DNG source";
     else {
-        StabParams warp{};
         // In-frame gyro data is gathered in the background: give a short clip (or a cached one)
         // a moment, so that the text shows the result and not "Loading".
         for (int tries = 0; tries < 20; ++tries) {
-            clip = gyro_for_frame(path, sval(in, "gyroFile"), 0, in.haveMeta ? in.meta.width : 0, in.haveMeta ? in.meta.height : 0,
+            clip = gyro_for_frame(path, sval(in, "gyroFile"), frame, in.haveMeta ? in.meta.width : 0, in.haveMeta ? in.meta.height : 0,
                                   stab_settings(in, t), warp, status);
             if (status.compare(0, 7, "Loading") != 0) break;
             os::sleep_ms(15);
@@ -478,12 +674,18 @@ void sync_stab_status(Instance& in, double t) {
         }
         in.updating = was;
     }
+    sync_info(in, t, clip, warp);
     if (status == in.stabStatus) return;
     in.stabStatus = status;
     const bool was = in.updating;
     in.updating = true;
     gParam->paramSetValue(in.params.at("stabStatus"), status.c_str());
     in.updating = was;
+}
+
+// Smoothness (of the zoom) only acts with Zoom Mode Dynamic: greyed out otherwise.
+void sync_enabled(Instance& in, double t) {
+    if (in.zoomSmoothProps) set_i(in.zoomSmoothProps, kOfxParamPropEnabled, ival(in, "stabZoomMode", t) == 1 ? 1 : 0);
 }
 
 void set_temp_tint(Instance& in, double temp, double tint) {
@@ -505,10 +707,14 @@ OfxStatus create_instance(OfxImageEffectHandle h) {
                           "highlightRecovery", "gamutMapping", "preToneCurve", "softClip", "rowPhase",
                           "deZigzag", "fit", "sourceFile", "frameMode", "anchor", "stabStatus", "stabEnable", "stabSmoothness",
                           "stabRollingShutter", "stabSync", "stabFocal", "stabAutoZoom", "stabMaxZoom", "stabZoom", "gyroFile", "stabRange", "stabRangeStart", "stabRangeEnd",
-                          "stabZoomMode", "stabZoomSmooth", "stabReadout", "stabFocalAuto", "stabReadoutAuto"}) {
+                          "stabZoomMode", "stabZoomSmooth", "stabReadout", "stabFocalAuto", "stabReadoutAuto", "fitMode", "xfZoomX", "xfZoomY",
+                          "xfZoomLink", "xfPosX", "xfPosY", "xfRotation", "xfAnchorX", "xfAnchorY", "xfPitch", "xfYaw", "xfFlipH", "xfFlipV", "resampling",
+                          "infoExposure", "infoFormat", "infoLens", "infoCorrection", "lensShading", "lensDistortion", "lensShadingFile", "lensDistortionFile", "developRaw", "sourceGamma"}) {
         OfxParamHandle p = nullptr;
-        if (gParam->paramGetHandle(ps, n, &p, nullptr) != kOfxStatOK) return kOfxStatFailed;
+        OfxPropertySetHandle pp = nullptr;
+        if (gParam->paramGetHandle(ps, n, &p, &pp) != kOfxStatOK) return kOfxStatFailed;
         in->params[n] = p;
+        if (!std::strcmp(n, "stabZoomSmooth")) in->zoomSmoothProps = pp;
     }
     Instance* raw = in.release();
     gProp->propSetPointer(effect_props(h), kOfxPropInstanceData, 0, raw);
@@ -521,6 +727,7 @@ OfxStatus create_instance(OfxImageEffectHandle h) {
     } catch (...) {
     }
     try {
+        sync_enabled(*raw, 0);
         sync_stab_status(*raw, 0);
     } catch (...) {
     }
@@ -560,6 +767,17 @@ OfxStatus instance_changed(OfxImageEffectHandle h, OfxPropertySetHandle args) {
     } else if (name == "sourceFile" || name == kOfxImageEffectSimpleSourceClipName) {
         sync_metadata(*in, true);
         sync_stab_status(*in, t);
+    } else if ((name == "xfZoomX" || name == "xfZoomY" || name == "xfZoomLink") && reason == kOfxChangeUserEdited) {
+        // Linked zoom: show the same value in both fields.
+        if (ival(*in, "xfZoomLink", t)) {
+            in->updating = true;
+            const char* other = name == "xfZoomY" ? "xfZoomX" : "xfZoomY";
+            gParam->paramSetValue(in->params.at(other), dval(*in, name == "xfZoomY" ? "xfZoomY" : "xfZoomX", t));
+            in->updating = false;
+        }
+        sync_stab_status(*in, t);   // the crop factor in Clip Info
+    } else if (name == "fitMode" || name == "developRaw" || name == "sourceGamma" || name.compare(0, 4, "lens") == 0) {
+        sync_stab_status(*in, t);
     } else if (name == "gyroFile" || name.compare(0, 4, "stab") == 0) {
         // A value typed into Focal Length or Rolling Shutter ms is the user's from now on; 0 (or
         // the control's reset) hands the field back to the clip's value.
@@ -569,6 +787,7 @@ OfxStatus instance_changed(OfxImageEffectHandle h, OfxPropertySetHandle args) {
             gParam->paramSetValue(in->params.at(name == "stabFocal" ? "stabFocalAuto" : "stabReadoutAuto"), dval(*in, field, t) > 0 ? 0 : 1);
             in->updating = false;
         }
+        if (name == "stabZoomMode") sync_enabled(*in, t);
         if (name != "stabStatus") sync_stab_status(*in, t);
     }
     return kOfxStatOK;
@@ -578,6 +797,24 @@ OfxStatus clip_preferences(OfxImageEffectHandle h, OfxPropertySetHandle out) {
     (void)h;
     set_s(out, kOfxImageEffectPropPreMultiplication, kOfxImageOpaque);
     set_i(out, kOfxImageEffectFrameVarying, 1);
+    return kOfxStatOK;
+}
+
+// The node's frame is the timeline frame. Only said when the source clip's own frame differs
+// from it (then Fit Width / Fit Height need the room); otherwise the host's default stands.
+OfxStatus region_of_definition(OfxImageEffectHandle h, OfxPropertySetHandle args, OfxPropertySetHandle out) {
+    Instance* in = instance(h);
+    if (!in) return kOfxStatReplyDefault;
+    double time = 0, size[2] = {0, 0}, off[2] = {0, 0};
+    gProp->propGetDouble(args, kOfxPropTime, 0, &time);
+    if (gProp->propGetDoubleN(effect_props(h), kOfxImageEffectPropProjectSize, 2, size) != kOfxStatOK || !(size[0] > 0 && size[1] > 0)) return kOfxStatReplyDefault;
+    gProp->propGetDoubleN(effect_props(h), kOfxImageEffectPropProjectOffset, 2, off);
+    OfxRectD src{};
+    if (gEffect->clipGetRegionOfDefinition(in->source, time, &src) != kOfxStatOK) return kOfxStatReplyDefault;
+    const double want[4] = {off[0], off[1], off[0] + size[0], off[1] + size[1]};
+    if (std::fabs(src.x1 - want[0]) < 0.5 && std::fabs(src.y1 - want[1]) < 0.5 && std::fabs(src.x2 - want[2]) < 0.5 && std::fabs(src.y2 - want[3]) < 0.5)
+        return kOfxStatReplyDefault;
+    gProp->propSetDoubleN(out, kOfxImageEffectPropRegionOfDefinition, 4, want);
     return kOfxStatOK;
 }
 
@@ -647,7 +884,28 @@ OfxStatus render(OfxImageEffectHandle h, OfxPropertySetHandle args) {
     long long number = 0;
     int digits = 0;
     if (!frame_path(*in, args, time, path, number, prefix, digits, suffix, err)) { post_error(h, err); return kOfxStatFailed; }
-    auto frame = FrameCache::get().fetch(path, err);
+    const bool developRaw = ival(*in, "developRaw", time) != 0;
+    const bool wantShading = ival(*in, "lensShading", time) != 0;
+    const bool shading = developRaw && wantShading;
+    const std::string vignetteFile = shading ? sval(*in, "lensShadingFile") : std::string();
+    auto frame = FrameCache::get().fetch(path, err, shading, vignetteFile);
+    std::string substitute;
+    if (!frame && !prefix.empty() && err.compare(0, 11, "Cannot open") != 0 && err.compare(0, 11, "Read failed") != 0) {
+        // The file is there but its picture is damaged (seen in camera files: a corrupt LJ92 tile).
+        // Show the nearest earlier frame that decodes instead of failing, and say so.
+        for (long long k = number - 1; k >= std::max(0LL, number - 10) && !frame; --k) {
+            std::string e2;
+            frame = FrameCache::get().fetch(sequence_path(prefix, k, digits, suffix), e2, shading, vignetteFile);
+            if (frame) {
+                char buf[512];
+                std::snprintf(buf, sizeof buf, "Sigma fp RAW: frame %lld cannot be decoded (%s): the file is damaged; showing frame %lld instead.",
+                              number, err.c_str(), k);
+                substitute = buf;
+                number = k;
+                path = sequence_path(prefix, k, digits, suffix);
+            }
+        }
+    }
     if (!frame) { post_error(h, "Sigma fp RAW: " + err); return kOfxStatFailed; }
     // Read ahead in the playback direction.
     if (!prefix.empty()) {
@@ -658,9 +916,24 @@ OfxStatus render(OfxImageEffectHandle h, OfxPropertySetHandle args) {
             long long n = number + in->direction * k;
             if (n >= 0) ahead.push_back(sequence_path(prefix, n, digits, suffix));
         }
-        FrameCache::get().prefetch(ahead);
+        FrameCache::get().prefetch(ahead, shading, vignetteFile);
     }
     RawSettings s = settings(*in, time);
+    if (s.lensDistortion) {
+        std::string note;
+        lens_distortion(sval(*in, "lensDistortionFile"), frame->info, s.lensProfile, note);
+    }
+    if (!developRaw && wantShading) {
+        // Resolve's picture: the vignette's brightness is removed from it, in linear light.
+        std::string note;
+        bool ownColour = true;
+        if (!lens_vignette(sval(*in, "lensShadingFile"), frame->info, s.sourceVignette, ownColour, note)) s.sourceVignette = GainMap{};
+        s.sourceGamma = ival(*in, "sourceGamma", time);
+    }
+    {
+        std::string why;
+        s.binned = frame_binning(path, frame->info.width, frame->info.height, why);
+    }
     s.renderScaleX = scale[0];
     s.renderScaleY = scale[1];
     {
@@ -678,13 +951,63 @@ OfxStatus render(OfxImageEffectHandle h, OfxPropertySetHandle args) {
     t.boundsY = bounds[1] - rod[1];
     t.rodW = rod[2] - rod[0];
     t.rodH = rod[3] - rod[1];
+    {
+        // The timeline frame. When the node's frame has another shape (the host hands over the
+        // clip's own frame and fits it into the timeline afterwards), Fit Width / Fit Height
+        // still mean the timeline frame: its size in this frame's pixels, centred on it.
+        double proj[2] = {0, 0};
+        if (gProp->propGetDoubleN(effect_props(h), kOfxImageEffectPropProjectSize, 2, proj) != kOfxStatOK || !(proj[0] > 0 && proj[1] > 0)) proj[0] = proj[1] = 0;
+        proj[0] *= scale[0]; proj[1] *= scale[1];
+        if (proj[0] > 0 && t.rodW > 0 && t.rodH > 0) {
+            const double shape = (proj[0] / proj[1]) / (static_cast<double>(t.rodW) / t.rodH);
+            if (std::fabs(shape - 1) > 0.004) {
+                const double k = std::min(proj[0] / t.rodW, proj[1] / t.rodH);   // how the host fits this frame into the timeline
+                t.compW = proj[0] / k;
+                t.compH = proj[1] / k;
+            }
+        }
+        std::lock_guard<std::mutex> l(in->rangeM);
+        in->lastRodW = t.rodW; in->lastRodH = t.rodH;
+        in->lastProjW = proj[0]; in->lastProjH = proj[1];
+    }
     if (cudaEnabled) t.device = reinterpret_cast<CUdeviceptr>(data);
     else t.host = data;
-    if (!Developer::get().develop(*frame, s, static_cast<CUstream>(stream), t, err)) {
+    // Develop RAW off: Resolve's own picture of the clip is the input.
+    SourceImage source;
+    OfxPropertySetHandle srcImg = nullptr;
+    struct ReleaseSource { OfxPropertySetHandle& p; ~ReleaseSource() { if (p) gEffect->clipReleaseImage(p); } } releaseSource{srcImg};
+    if (!developRaw) {
+        if (gEffect->clipGetImage(in->source, time, nullptr, &srcImg) != kOfxStatOK || !srcImg) {
+            srcImg = nullptr;
+            post_error(h, "Sigma fp RAW: the host did not supply the clip's picture (needed with Develop RAW off).");
+            return kOfxStatFailed;
+        }
+        void* srcData = nullptr;
+        int sb[4] = {}, sr[4] = {};
+        gProp->propGetPointer(srcImg, kOfxImagePropData, 0, &srcData);
+        gProp->propGetIntN(srcImg, kOfxImagePropBounds, 4, sb);
+        if (gProp->propGetIntN(srcImg, kOfxImagePropRegionOfDefinition, 4, sr) != kOfxStatOK) std::memcpy(sr, sb, sizeof sr);
+        gProp->propGetInt(srcImg, kOfxImagePropRowBytes, 0, &source.rowBytes);
+        if (!srcData || get_s(srcImg, kOfxImageEffectPropPixelDepth) != kOfxBitDepthFloat || get_s(srcImg, kOfxImageEffectPropComponents) != kOfxImageComponentRGBA) {
+            post_error(h, "Sigma fp RAW needs 32-bit float RGBA images (Develop RAW off).");
+            return kOfxStatErrFormat;
+        }
+        if (cudaEnabled) source.device = reinterpret_cast<CUdeviceptr>(srcData);
+        else source.host = srcData;
+        source.width = sb[2] - sb[0];
+        source.height = sb[3] - sb[1];
+        source.offX = sb[0] - sr[0];
+        source.offTop = sr[3] - sb[3];
+        source.rodW = sr[2] - sr[0];
+        source.rodH = sr[3] - sr[1];
+    }
+    if (!Developer::get().develop(*frame, s, static_cast<CUstream>(stream), t, err, nullptr, developRaw ? nullptr : &source)) {
         post_error(h, "Sigma fp RAW: " + err);
         return kOfxStatFailed;
     }
-    clear_error(h);
+    if (substitute.empty()) clear_error(h);
+    else if (gMsg2) gMsg2->setPersistentMessage(h, kOfxMessageWarning, "sfp_warning", "%s", substitute.c_str());
+    else if (gMsg1) gMsg1->message(h, kOfxMessageWarning, "sfp_warning", "%s", substitute.c_str());
     return kOfxStatOK;
 }
 
@@ -708,6 +1031,7 @@ OfxStatus main_entry(const char* action, const void* handle, OfxPropertySetHandl
         if (!std::strcmp(action, kOfxActionInstanceChanged)) return instance_changed(h, in);
         if (!std::strcmp(action, kOfxImageEffectActionGetClipPreferences)) return clip_preferences(h, out);
         if (!std::strcmp(action, kOfxImageEffectActionRender)) return render(h, in);
+        if (!std::strcmp(action, kOfxImageEffectActionGetRegionOfDefinition)) return region_of_definition(h, in, out);
         if (!std::strcmp(action, kOfxImageEffectActionIsIdentity)) return kOfxStatReplyDefault;
         if (!std::strcmp(action, kOfxImageEffectActionBeginSequenceRender) || !std::strcmp(action, kOfxImageEffectActionEndSequenceRender))
             return kOfxStatOK;
@@ -722,7 +1046,7 @@ OfxStatus main_entry(const char* action, const void* handle, OfxPropertySetHandl
 
 void set_host(OfxHost* host) { gHost = host; }
 
-OfxPlugin gPlugin = {kOfxImageEffectPluginApi, 1, "com.sigmafpmods.raw", 1, 4, set_host, main_entry};
+OfxPlugin gPlugin = {kOfxImageEffectPluginApi, 1, "com.sigmafpmods.raw", 1, 7, set_host, main_entry};
 
 }  // namespace
 

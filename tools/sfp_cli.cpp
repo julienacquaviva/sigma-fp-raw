@@ -5,11 +5,17 @@
 //   sfp_cli play FIRST.DNG COUNT [fps=50] [key=value ...]
 // keys: phase=auto|off|<value>  quality=0|1  exposure= wb=asshot|custom temp= tint=
 //       cs=709|p3|2020|dwg|ap0|ap1  gamma=lin|22|24|709|srgb|di|cct  sharp= sat= contrast=
-//       hl= sh= mid= boost= lift= gain= hr=0|1 width= height= fit=fit|fill|stretch|native
+//       hl= sh= mid= boost= lift= gain= hr=0|1 width= height= fit=fit|fill|stretch|native|width|height
+//       zx= zy= px= py= rot= ax= ay= pitch= yaw= fliph=0|1 flipv=0|1 (Transform) scale= (render scale)
+//       resample=lanczos3|lanczos2|catmull|bilinear
+//   sfp_cli map CROPW CROPH WIDTH HEIGHT [fit/transform keys] [pt=x,y ...]
+//     where each output pixel position (RoD coordinates, y down) is read in the crop (JSON)
 //       device=1 (develop only: render into a GPU image like a CUDA host, then download)
 //       clip=<DNG frames of the clip> (gyro only; found by itself for a DNG path)
 //       range=<first>-<last> (DNG numbers the smoothing and zoom are based on) zoommode=fixed|dynamic zoomsmooth=<s>
 //       marks=raw (each frame's time from its own mark, as before v1.3.1; for measurements)
+//       shading=0|1 (lens shading map of the frame: vignette and colour shading; default 1)
+//       distortion=0|1 (lens distortion profile of the frame; default 0)
 //       stab=0|1 smooth=<s> rs=0..1 sync=<ms> focal=<mm> readout=<ms> autozoom=0|1 maxzoom= zoom= gyro=<file.FPG>
 //   sfp_cli gyro FILE.FPG|CLIP_FRAME.DNG [frame=N] [path=1] [stab keys] [pt=x,y ...]
 //     prints the file's header and, for frame N, the stabilisation warp as JSON; each pt is a
@@ -29,11 +35,16 @@
 
 #include "../src/develop.h"
 #include "../src/gyro.h"
+#include "../src/lens_profile.h"
 
 using namespace sfp;
 using clk = std::chrono::steady_clock;
 
 static StabSettings gStab;
+static std::string gVignetteFile, gDistortionFile;   // vfile= dfile=: profile files, as the plug-in's two file fields
+static std::string gLensName;      // lensname= clipfocal= clipaperture= clipdistance=: stand in for the clip's EXIF (tests of profile files)
+static double gClipFocal = 0, gClipAperture = 0, gClipDistance = 0;
+static bool gShading = true;   // shading=0|1: the lens shading map (vignette, colour shading), as the plug-in's Vignette Correction
 static std::string gGyroFile;
 static bool gDevice = false;   // develop into a GPU image (the path a CUDA host uses), then download
 
@@ -67,6 +78,14 @@ static bool apply(RawSettings& s, const std::string& kv, int& w, int& h, double&
     else if (k == "height") h = static_cast<int>(d);
     else if (k == "fps") fps = d;
     else if (k == "stab") gStab.enable = d != 0;
+    else if (k == "shading") gShading = d != 0;
+    else if (k == "vfile") gVignetteFile = v;
+    else if (k == "lensname") gLensName = v;
+    else if (k == "clipfocal") gClipFocal = d;
+    else if (k == "clipaperture") gClipAperture = d;
+    else if (k == "clipdistance") gClipDistance = d;
+    else if (k == "dfile") gDistortionFile = v;
+    else if (k == "distortion") s.lensDistortion = d != 0;
     else if (k == "smooth") gStab.smoothness = d;
     else if (k == "rs") gStab.rollingShutter = d;
     else if (k == "sync") gStab.syncMs = d;
@@ -89,7 +108,21 @@ static bool apply(RawSettings& s, const std::string& kv, int& w, int& h, double&
     else if (k == "zoomsmooth") gStab.zoomSmooth = d;
     else if (k == "device") gDevice = d != 0;
     else if (k == "gyro") gGyroFile = v;
-    else if (k == "fit") s.fit = v == "fill" ? Fit::Fill : v == "stretch" ? Fit::Stretch : v == "native" ? Fit::Native : Fit::Fit;
+    else if (k == "fit") s.fit = v == "fill" ? Fit::Fill : v == "stretch" ? Fit::Stretch : v == "native" ? Fit::Native
+                               : v == "width" ? Fit::FitWidth : v == "height" ? Fit::FitHeight : Fit::Fit;
+    else if (k == "zx") s.xf.zoomX = d;
+    else if (k == "zy") s.xf.zoomY = d;
+    else if (k == "px") s.xf.posX = d;
+    else if (k == "py") s.xf.posY = d;
+    else if (k == "rot") s.xf.rotation = d;
+    else if (k == "ax") s.xf.anchorX = d;
+    else if (k == "ay") s.xf.anchorY = d;
+    else if (k == "pitch") s.xf.pitch = d;
+    else if (k == "yaw") s.xf.yaw = d;
+    else if (k == "fliph") s.xf.flipH = d != 0;
+    else if (k == "flipv") s.xf.flipV = d != 0;
+    else if (k == "scale") s.renderScaleX = s.renderScaleY = d;
+    else if (k == "resample") s.resampler = v == "bilinear" ? 0 : v == "catmull" ? 1 : v == "lanczos2" ? 2 : 3;
     else return false;
     return true;
 }
@@ -181,12 +214,18 @@ static int gyro_report(int argc, char** argv) {
     if (clip->inFrame) file.clear();
     const GyroHeader& g = clip->h;
     std::printf("\"file\": \"%s\",\n ", json(file).c_str());
+    if (argv[2] != file) {
+        std::string why;
+        const int b = frame_binning(argv[2], clip->h.rasterW, clip->h.rasterH, why);
+        std::printf("\"binned\": %d, \"binned_why\": \"%s\",\n ", b, why.c_str());
+    }
     std::printf("\"version\": %d, \"frames\": %u, \"samples\": %u, \"rate_hz\": %.6f, \"lsb_per_dps\": %.6f,\n", g.version, g.frameCount, g.sampleCount, g.rateHz, g.lsbPerDps);
     std::printf(" \"raster\": [%d, %d], \"active\": [%d, %d, %d, %d], \"fps\": %.6f, \"readout_us\": %.0f, \"exposure_us\": %.0f,\n",
                 g.rasterW, g.rasterH, g.activeX, g.activeY, g.activeW, g.activeH, g.fps, g.readoutS * 1e6, g.exposureS * 1e6);
     std::printf(" \"focal_um\": %.0f, \"mark_delay_us\": %.0f, \"axes\": [%d, %d, %d], \"flags\": %u, \"preroll\": %u, \"pitch_nm\": %.0f,\n",
                 g.focalMm * 1e3, g.markDelayS * 1e6, g.axis[0], g.axis[1], g.axis[2], g.flags, g.preroll, g.pitchNm);
     std::printf(" \"resolution\": %u, \"dc_crop\": %u, \"bit_depth\": %u, \"sensor_mode\": %u,\n", g.resolution, g.dcCrop, g.bitDepth, g.sensorMode);
+    std::printf(" \"window\": [%d, %d], \"recorded\": [%d, %d], \"window_source\": %d,\n", g.windowW, g.windowH, g.recordedW, g.recordedH, g.windowSource);
     StabParams p{};
     std::string why;
     clip->warp(frame, gStab, p, why);
@@ -239,7 +278,8 @@ static int block_report(const char* path) {
     GyroBlock b;
     std::string why;
     if (!read_fpg2(path, b, &why)) { std::printf("{\"present\": 0, \"why\": \"%s\"}\n", why.c_str()); return 1; }
-    std::printf("{\"present\": 1, \"frame\": %u, \"clock_us\": %u, \"n\": %zu, \"ring_index\": %u, \"flags\": %u, \"lost\": %u, \"take\": %u,\n"
+    std::printf("{\"window\": [%u, %u], \"recorded\": [%u, %u],\n ", b.windowW, b.windowH, b.recordedW, b.recordedH);
+    std::printf("\"present\": 1, \"frame\": %u, \"clock_us\": %u, \"n\": %zu, \"ring_index\": %u, \"flags\": %u, \"lost\": %u, \"take\": %u,\n"
                 " \"readout_us\": %u, \"mark_delay_us\": %d, \"sensor_mode\": %u, \"resolution\": %u, \"dc_crop\": %u, \"bit_depth\": %u,\n"
                 " \"axes\": [%d, %d, %d], \"lsb_per_dps\": %u, \"samples\": [",
                 b.frame, b.clockUs, b.samples.size() / 3, b.ringIndex, b.flags, b.lost, b.take, b.readoutUs, b.markDelayUs, b.sensorMode,
@@ -323,7 +363,36 @@ static int selftest(const char* fpg) {
     std::_Exit(ok ? 0 : 1);
 }
 
+// Fit + Transform geometry: output position -> crop position, the same mapping the kernels use.
+static int map_report(int argc, char** argv) {
+    RawSettings s;
+    int w = 0, h = 0;
+    double fps = 0;
+    std::vector<std::pair<double, double>> pts;
+    for (int i = 6; i < argc; ++i) {
+        double x, y;
+        if (std::sscanf(argv[i], "pt=%lf,%lf", &x, &y) == 2) pts.push_back({x, y});
+        else if (!apply(s, argv[i], w, h, fps)) { std::printf("bad option %s\n", argv[i]); return 2; }
+    }
+    Target t;
+    t.width = t.rodW = std::atoi(argv[4]);
+    t.height = t.rodH = std::atoi(argv[5]);
+    DevelopParams p{};
+    frame_geometry(std::atoi(argv[2]), std::atoi(argv[3]), s, t, p);
+    std::printf("{\"scale\": [%.9f, %.9f], \"offset\": [%.6f, %.6f], \"xform\": %d, \"nearest\": %d, \"points\": [", p.scaleX, p.scaleY, p.offX, p.offY,
+                p.xform, p.nearest);
+    for (size_t i = 0; i < pts.size(); ++i) {
+        float ix = static_cast<float>(pts[i].first), iy = static_cast<float>(pts[i].second);
+        bool ok = !p.xform || xform_map(p, ix, iy, &ix, &iy);
+        const double sx = (ix - p.offX) / p.scaleX, sy = (iy - p.offY) / p.scaleY;
+        std::printf("%s[%.4f, %.4f, %.6f, %.6f, %d]", i ? ", " : "", pts[i].first, pts[i].second, sx, sy, ok ? 1 : 0);
+    }
+    std::printf("]}\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 6 && !std::strcmp(argv[1], "map")) return map_report(argc, argv);
     if (argc >= 2 && !std::strcmp(argv[1], "selftest")) return selftest(argc >= 3 ? argv[2] : nullptr);
     if (argc >= 3 && !std::strcmp(argv[1], "gyro")) { int r = gyro_report(argc, argv); std::fflush(stdout); gyro_shutdown(); return r; }
     if (argc >= 3 && !std::strcmp(argv[1], "fpg2")) return block_report(argv[2]);
@@ -359,11 +428,42 @@ int main(int argc, char** argv) {
     };
     if (mode == "develop") {
         auto t0 = clk::now();
-        auto f = FrameCache::get().fetch(argv[2], err);
+        auto f = FrameCache::get().fetch(argv[2], err, gShading, gVignetteFile);
         if (!f) { std::printf("ERR %s\n", err.c_str()); return 1; }
         double fetchMs = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         if (!w) { w = f->info.cropW; h = f->info.cropH; }
+        {
+            std::string note;
+            GainMap map;
+            DngInfo clip = f->info;
+            if (!gLensName.empty()) clip.lensModel = gLensName;
+            if (gClipFocal > 0) clip.focalMm = gClipFocal;
+            if (gClipAperture > 0) clip.fNumber = gClipAperture;
+            if (gClipDistance > 0) clip.focusM = gClipDistance;
+            bool ownColour = true;
+            const bool v = lens_vignette(gVignetteFile, clip, map, ownColour, note);
+            std::printf("vignette: %s\n", note.c_str());
+            if (v) std::printf("  map %dx%d x %d, gain at the sensor's corner %.4f, middle of the long edge %.4f, of the short edge %.4f\n", map.cols, map.rows, map.planes,
+                               map.gain[map.planes == 3 ? 1 : 0], map.gain[(static_cast<size_t>(map.rows / 2) * map.cols) * map.planes + (map.planes == 3 ? 1 : 0)],
+                               map.gain[static_cast<size_t>(map.cols / 2) * map.planes + (map.planes == 3 ? 1 : 0)]);
+            if (s.lensDistortion) {
+                const bool ok = lens_distortion(gDistortionFile, clip, s.lensProfile, note);
+                std::printf("distortion: %s\n", note.c_str());
+                if (ok) std::printf("  radius %.1f sensor px, factor terms %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n", s.lensProfile.radius, s.lensProfile.c[0], s.lensProfile.c[1],
+                                    s.lensProfile.c[2], s.lensProfile.c[3], s.lensProfile.c[4], s.lensProfile.c[5], s.lensProfile.c[6]);
+            }
+        }
         stabilise(argv[2], *f, true);
+        {
+            std::string why;
+            s.binned = frame_binning(argv[2], f->info.width, f->info.height, why);
+            std::printf("row phase + edge anti-aliasing: %s (%s)\n", s.binned != 0 && f->info.width == 3024 && f->info.height == 2010 ? "on" : "off", why.c_str());
+            // Camera -> output matrix of this frame at the current settings (for the tests).
+            ColorSetup cs = color_setup(f->info, s.whiteBalance == WhiteBalance::AsShot, s.colorTemp, s.tint, s.colorSpace);
+            std::printf("matrix:");
+            for (int i = 0; i < 9; ++i) std::printf(" %.9g", cs.matrix[i]);
+            std::printf("\n");
+        }
         std::vector<float> img(static_cast<size_t>(w) * h * 4);
         Target t;
         t.host = img.data(); t.width = w; t.height = h; t.rowBytes = w * 16; t.rodW = w; t.rodH = h;
@@ -430,10 +530,14 @@ int main(int argc, char** argv) {
             std::string path = sequence_path(prefix, first + i, digits, suffix);
             std::vector<std::string> ahead;
             for (int k = 1; k <= 32; ++k) ahead.push_back(sequence_path(prefix, first + i + k, digits, suffix));
-            auto f = FrameCache::get().fetch(path, err);
-            FrameCache::get().prefetch(ahead);
+            auto f = FrameCache::get().fetch(path, err, gShading, gVignetteFile);
+            FrameCache::get().prefetch(ahead, gShading, gVignetteFile);
             if (!f) { std::printf("ERR %s: %s\n", path.c_str(), err.c_str()); return 1; }
             stabilise(path, *f, false);
+            {
+                std::string why;
+                s.binned = frame_binning(path, f->info.width, f->info.height, why);
+            }
             if (!Developer::get().develop(*f, s, stream, t, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
             cu.cuStreamSynchronize(stream);
             double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();

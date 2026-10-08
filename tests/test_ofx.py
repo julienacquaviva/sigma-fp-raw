@@ -19,7 +19,7 @@ CLIP = Path(sys.argv[1] if len(sys.argv) > 1 else 'F:/CINEMA/A001_065')
 
 def cli_reference(path, w, h, *opts):
     out = Path(tempfile.gettempdir()) / f'sfp_ref_{Path(path).stem}.tif'
-    subprocess.run([str(ROOT / 'build/sfp_cli.exe'), 'develop', str(path), str(out), f'width={w}', f'height={h}', *opts],
+    subprocess.run([str(ROOT / 'build/sfp_cli.exe'), 'develop', str(path), str(out), f'width={w}', f'height={h}', 'stab=0', 'distortion=1', *opts],   # the plug-in's default since 1.6.0: not stabilised
                    check=True, capture_output=True)
     return tifffile.imread(out).astype(np.float64) / 65535.0
 
@@ -34,6 +34,8 @@ def main():
         print('PASS', name, info if info else '')
 
     host = OFXHost(PLUGIN, canvas=(3008, 2000))
+    assert host.get('developRaw') == 0                        # off by default since 1.9.2
+    host.set(developRaw=1)                                    # these tests are about the plug-in's own development
     params = set(host.params())
     raw_controls = {'decodeQuality', 'whiteBalance', 'colorSpace', 'gamma', 'colorTemp', 'tint', 'exposure', 'sharpness',
                     'highlights', 'shadows', 'colorBoost', 'saturation', 'midtones', 'lift', 'gain', 'contrast',
@@ -56,11 +58,22 @@ def main():
     assert 'sigma' not in params and 'source' not in params
     assert all(prop(n, 'OfxParamPropParent') is None for n in ('rowPhase', 'deZigzag', 'fit', 'sourceFile', 'frameMode', 'anchor'))
     groups = sorted(n for n in params if prop(n, 'OfxParamPropType') == 'OfxParamTypeGroup')
-    assert groups == ['raw', 'stab'], groups
-    visible = sorted(n for n in params if not prop(n, 'OfxParamPropSecret') and prop(n, 'OfxParamPropParent') not in ('raw', 'stab') and n not in groups)
-    assert visible == ['Controls', 'info'], visible
+    assert groups == ['clipInfo', 'lens', 'raw', 'stab', 'xform'], groups
+    visible = sorted(n for n in params if not prop(n, 'OfxParamPropSecret') and prop(n, 'OfxParamPropParent') not in ('clipInfo', 'lens', 'raw', 'stab', 'xform') and n not in groups)
+    assert visible == ['Controls'], visible
+    # 1.6.0: a Clip Info block of four read-only rows at the top; Fit is the first control of the Transform group.
+    order = [v for v in host.obj(host.obj(host.params()['Controls'])['props'])['values']['OfxParamPropPageChild']]
+    assert order[:5] == ['clipInfo', 'info', 'infoExposure', 'infoFormat', 'infoLens'], order[:5]
+    assert order[order.index('xform') + 1] == 'fitMode' and prop('fitMode', 'OfxParamPropParent') == 'xform'
+    # 1.7.0: a Lens Correction group with two switches, both on.
+    li = order.index('lens')
+    assert order[li:li + 6] == ['lens', 'infoCorrection', 'lensShading', 'lensDistortion', 'lensShadingFile', 'lensDistortionFile'] and host.get('lensShadingFile') == host.get('lensDistortionFile') == ''
+    # 1.9.3: the groups in the order Clip Info, Transform, Camera RAW, Lens Correction, Stabilisation.
+    assert [n for n in order if n in groups] == ['clipInfo', 'xform', 'raw', 'lens', 'stab'], [n for n in order if n in groups]
+    assert (host.get('lensShading'), host.get('lensDistortion')) == (0, 0)
+    host.set(lensShading=1, lensDistortion=1)                 # as the reference of the tests below (the command-line tool's defaults)
     shown = sorted(n for n in params if not prop(n, 'OfxParamPropSecret') and prop(n, 'OfxParamPropParent') == 'raw')
-    assert 'highlightRecovery' not in shown and 'exposure' in shown and len(shown) == 16, shown
+    assert 'highlightRecovery' not in shown and 'exposure' in shown and 'developRaw' in shown and 'sourceGamma' in shown and len(shown) == 18, shown
     ok('hidden: Highlight Recovery, Gamut Mapping, Pre Tone Curve, Soft Clip (all off), Frame Mapping (Resolve Source Frame), '
        'Timeline Anchor (0), Row Phase (-0.125), Edge Anti-aliasing (80), Image Fit (Scale to Fit), First DNG File (empty); '
        'no Sigma fp or Advanced group', hidden_defaults=hidden)
@@ -82,6 +95,40 @@ def main():
         assert diff <= 1.0 / 65535 + 1e-6, diff
         assert np.all(out.pixels[..., 3] == 1.0)
         ok(f'Resolve source frame {idx} -> {frames[idx].name}: matches CLI develop', max_diff=float(diff))
+
+    # Clip Info rows: filled from the DNG when the source is known, the frame sizes after a render.
+    host.changed('Source')
+    rows = {n: host.get(n) for n in ('info', 'infoExposure', 'infoFormat', 'infoLens', 'infoCorrection')}
+    assert rows['info'] == first.name and 'ISO ' in rows['infoExposure'] and ' fps' in rows['infoExposure'], rows
+    assert '-bit | ' in rows['infoFormat'] and ' mm' in rows['infoLens'] and 'infoOutput' not in host.params(), rows
+    ok('Clip Info rows', **rows)
+
+    # Fit Width / Fit Height mean the timeline frame, also when the node's frame has another shape:
+    # node frame 3008x2000 in a 3840x2160 timeline = the timeline is 3555.6 x 2000 of the node's pixels.
+    cw, ch = (float(v) for v in host.get('infoFormat').split('> ')[1].split()[0].split('x'))
+    base = min(3008 / cw, 2000 / ch)                       # Scale to Fit
+    project = props.get('OfxImageEffectPropProjectSize')
+    diffs = {}
+    for mode, scale in ((1, 3840 / 2160 * 2000 / cw), (2, 2000 / ch)):
+        props['OfxImageEffectPropProjectSize'] = [3008.0, 2000.0]
+        host.set(fitMode=0, xfZoomX=scale / base, xfZoomY=scale / base)
+        _, want = host.render(source_frame=100)
+        props['OfxImageEffectPropProjectSize'] = [3840.0, 2160.0]
+        host.set(fitMode=mode, xfZoomX=1.0, xfZoomY=1.0)
+        _, got = host.render(source_frame=100)
+        diffs[mode] = float(np.abs(got.pixels - want.pixels).mean())
+        assert diffs[mode] < 2e-3, diffs
+    host.set(fitMode=0)
+    _, fit = host.render(source_frame=100)                 # Scale to Fit does not look at the timeline frame
+    props['OfxImageEffectPropProjectSize'] = [3008.0, 2000.0]
+    _, fit0 = host.render(source_frame=100)
+    assert np.array_equal(fit.pixels, fit0.pixels)
+    if project is None:
+        props.pop('OfxImageEffectPropProjectSize')
+    else:
+        props['OfxImageEffectPropProjectSize'] = project
+    ok('Fit Width / Fit Height fill the timeline frame when the node frame has another shape (3008x2000 node frame, 16:9 timeline)',
+       mean_diff_to_the_same_zoom=diffs)
 
     # Padded negative stride and a partial render window (bounds) equal the full render.
     status, full = host.render(source_frame=100)
@@ -145,6 +192,7 @@ def main():
     host.close()
     # UHD timeline: 3008x2000 scaled to fit 3840x2160 -> pillarbox.
     uhd = OFXHost(PLUGIN, canvas=(3840, 2160))
+    uhd.set(developRaw=1)
     uhd.obj(uhd.obj(uhd.instance)['props'])['values']['OfxImageEffectPropSrcFilePath'] = [str(first)]
     status, u = uhd.render(source_frame=100)
     assert status == OK

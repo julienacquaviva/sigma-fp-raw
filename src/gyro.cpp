@@ -17,17 +17,8 @@ namespace sfp {
 namespace {
 
 const double kPi = 3.14159265358979323846;
-// Sensor width the raster stands for, used for the pixel pitch when the file does not
-// carry one. Calibrated, not nominal: on A001_092 (3264 raster, 28 mm) the picture moves by
-// 49.1 px per degree of gyro rotation in x and y, which is 28 mm over a 32.5 mm wide raster.
-// The fp's sensor is 35.9 mm wide (44.4 px per degree); the 10.5 % difference is not
-// explained yet (lens, gyro scale or readout crop) and has been measured with one lens only.
-const double kSensorWidthMm = 32.5;
-// The other modes: on A001_001 (MQ, 3024 raster, 28 mm) the picture moves by 0.906 of what
-// 32.5 mm predicts, which is the fp's full sensor width (MQ is the whole sensor binned by 2;
-// HQ reads a narrower part of it).
-const double kFullSensorWidthMm = 35.9;
-const int kHqRasterWidth = 3264;
+// Pixel pitch of the fp's sensor at its full 6000 x 4000 readout (36 mm wide).
+const double kSensorPitchMm = 0.006;
 // Mark delay = readout/2 + exposure/2 + this. Fitted on the picture: +0.3 ms (A001_001, MQ 50,
 // 1/640 s), -1.6 to +0.5 ms (A001_002, same mode, noisier), +0.8 ms (A001_092, HQ 25, 1/100 s).
 // All within the scatter of the measurements, so no constant is added.
@@ -168,6 +159,35 @@ static void regular_marks(const std::vector<double>& m, const std::vector<uint8_
     for (int i = 0; i < n; ++i) out[i] = cadence[i] * T + env[i] + typicalLate;
 }
 
+// ---- image scale ----
+
+// Sensor window of a clip from what its gyro data says. R124 writes the window and the recorded
+// size; R123 marks MQ 50 with crop code 2 (the 4608 x 3072 window, 1:1); R122 wrote MQ 50 with
+// crop code 0, recognisable by its readout (18926 us) and the MQ frame size. Every earlier mode
+// (HQ, XQ, UHD, LQ, MQ) uses the whole sensor width (framing test of 2026-10-02); DC Crop the
+// 1.49 diagonal crop.
+void window_for(unsigned crop, unsigned ww, unsigned wh, unsigned rw, unsigned rh, double readoutUs, GyroHeader& h) {
+    const bool mq = h.activeW == 3000 && h.activeH == 2000;
+    if (ww > 0 && rw > 0) {
+        h.windowW = static_cast<int>(ww); h.windowH = static_cast<int>(wh);
+        h.recordedW = static_cast<int>(rw); h.recordedH = static_cast<int>(rh);
+        h.windowSource = 1;
+        return;
+    }
+    h.recordedW = h.activeW;
+    h.recordedH = h.activeH;
+    if (mq && (crop == 2 || std::lround(readoutUs) == 18926)) {
+        h.windowW = 4608; h.windowH = 3072;
+        h.windowSource = crop == 2 ? 2 : 3;
+    } else if (crop == 1) {
+        h.windowW = 4024; h.windowH = 2682;
+        h.windowSource = 4;
+    } else {
+        h.windowW = 6000; h.windowH = 4000;
+        h.windowSource = 0;
+    }
+}
+
 // ---- file ----
 
 std::shared_ptr<GyroClip> GyroClip::parse(const uint8_t* d, size_t size, std::string& e) {
@@ -212,6 +232,7 @@ std::shared_ptr<GyroClip> GyroClip::parse(const uint8_t* d, size_t size, std::st
     if (h.activeW <= 0 || h.activeH <= 0 || h.activeX + h.activeW > h.rasterW || h.activeY + h.activeH > h.rasterH) {
         h.activeX = h.activeY = 0; h.activeW = h.rasterW; h.activeH = h.rasterH;
     }
+    window_for(h.dcCrop ? 1 : 0, 0, 0, 0, 0, h.readoutS * 1e6, h);
     std::vector<uint32_t> table(h.frameCount);
     for (uint32_t i = 0; i < h.frameCount; ++i) table[i] = u32(d + header + 4ull * i);
     std::vector<int16_t> samples(3ull * h.sampleCount);
@@ -408,8 +429,9 @@ double GyroClip::focal_px(const StabSettings& s, std::string* why) const {
         if (why) *why = "the file has no focal length (manual lens): set Focal Length";
         return 0;
     }
-    const double widthMm = h.rasterW == kHqRasterWidth ? kSensorWidthMm : kFullSensorWidthMm;
-    double pitchMm = h.pitchNm > 0 ? h.pitchNm * 1e-6 : widthMm / (h.dcCrop ? 1.5 : 1.0) / h.rasterW;
+    // The recorded frame shows windowW sensor pixels across recordedW pixels.
+    double pitchMm = h.pitchNm > 0 ? h.pitchNm * 1e-6
+                                   : kSensorPitchMm * (h.windowW > 0 ? h.windowW : 6000) / (h.recordedW > 0 ? h.recordedW : h.activeW);
     return mm / pitchMm;
 }
 
@@ -710,12 +732,14 @@ double GyroClip::auto_zoom(const StabSettings& s) const {
 
 bool GyroClip::warp(long long i, const StabSettings& s, StabParams& out, std::string& why) const {
     out.on = 0;
+    out.row0 = 0;
     if (!s.enable) { why = "switched off"; return false; }
     const double f = focal_px(s, &why);
     if (!(f > 0)) return false;
     out.focal = static_cast<float>(f);
     out.cx = h.rasterW * 0.5f; out.cy = h.rasterH * 0.5f;
     out.rows = static_cast<float>(h.rasterH);
+    out.row0 = 0;
     const double manual = std::clamp(s.zoom, 0.1, 10.0);
     if (!has_data(i)) {
         // No gyro data for this frame: the picture as recorded, with the manual zoom only.
@@ -752,6 +776,11 @@ std::string GyroClip::status(const StabSettings& s) const {
     if (f > 0) {
         std::snprintf(buf, sizeof buf, ", %.1f mm%s = %.0f px", s.focalMm > 0 ? s.focalMm : h.focalMm, s.focalMm > 0 ? " (override)" : "", f);
         out += buf;
+        if (h.pitchNm <= 0 && h.windowW > 0 && h.windowW != 6000) {
+            const char* why[] = {"", "", ", MQ 50", ", MQ 50, recognised by its readout", ", DC Crop"};
+            std::snprintf(buf, sizeof buf, " (sensor window %dx%d%s)", h.windowW, h.windowH, why[std::clamp(h.windowSource, 0, 4)]);
+            out += buf;
+        }
         if (s.enable) {
             const double manual = std::clamp(s.zoom, 0.1, 10.0);
             double zlo, zmean, zhi;

@@ -14,6 +14,8 @@ own decoder. You put it on the first node of the clip and grade after it.
 - **Compressed and uncompressed frames**: lossless JPEG (LJ92) tiles and packed 12-bit strips.
 - **Sigma fp 3K fixes**: the row offset of the binned 3K readout is corrected, and the stair-steps it leaves on sharp near-horizontal edges are smoothed.
 - **Gyro stabilisation and rolling-shutter correction** with no setup, for clips that carry gyro data.
+- **Lens correction**: vignette and distortion from the lens's own profile in the clip, from the Adobe lens profiles installed on the computer, or from a profile file (DNG, Adobe `.lcp`, Lensfun `.xml`).
+- **Your colour pipeline or the plug-in's**: by default the picture and the colour stay Resolve's own and the plug-in adds framing, stabilisation and lens correction; tick *Develop RAW* for the plug-in's own development.
 - **Windows, macOS and Linux.** No NVIDIA card? It develops on the processor instead, with the same picture.
 
 ## Download and install
@@ -71,12 +73,11 @@ machines for every change, but they have not yet been tried inside DaVinci Resol
 ## Use it in Resolve
 
 1. **Color page**: open *Effects*, find **Sigma fp RAW** in the *Sigma fp* group, and drop it on the **first node** of a Sigma fp CinemaDNG clip. Grade on the nodes after it.
-2. **Project Settings > Camera RAW > CinemaDNG**: set *Decode Quality* to **Quarter Res.** Resolve still decodes the clip for the node's input, but the plug-in replaces that picture, so the lowest quality only saves time.
-3. **Colour management**:
-   - Unmanaged timeline: leave the plug-in at Rec.709 / Rec.709.
-   - DaVinci Wide Gamut timeline: set the plug-in to *Color Space* **DaVinci Wide Gamut** and *Gamma* **DaVinci Intermediate**.
+2. Choose who develops the picture, with **Develop RAW** in the *Camera RAW* group:
+   - **Off (the default)**: the picture and the colour are Resolve's own. Its Camera RAW settings (for example Blackmagic Design colour space and Blackmagic Design Film gamma), your colour management and your PowerGrades work as without the plug-in. The plug-in adds the Transform, the stabilisation and the lens corrections on that picture. Leave Resolve's input scaling at *Scale to Fit*. For the Vignette Correction, set **Resolve Gamma** to the Gamma of Resolve's Camera RAW panel.
+   - **On**: the plug-in develops the original DNG frames itself, at full resolution, with its own Camera RAW controls, the Sigma fp 3K fixes and the colour shading correction; Resolve's Camera RAW settings then do nothing. Set *Project Settings > Camera RAW > CinemaDNG > Decode Quality* to **Quarter Res.** (Resolve's picture is not used, so the lowest quality only saves time). Unmanaged timeline: leave the plug-in at Rec.709 / Rec.709. DaVinci Wide Gamut timeline: *Color Space* **DaVinci Wide Gamut** and *Gamma* **DaVinci Intermediate**.
 
-The *Source* line at the top of the panel shows the clip, its frame size, ISO, frame rate and as-shot white balance.
+*Clip Info* at the top of the panel shows the clip, shutter speed and angle, ISO, frame rate, aspect ratio, bit depth, the sensor window and the recorded resolution, the focal length and the crop against full frame.
 
 ## Controls
 
@@ -84,18 +85,51 @@ The *Source* line at the top of the panel shows the clip, its frame size, ISO, f
 
 | Control | What it does |
 |---|---|
+| Develop RAW | Off (default): Resolve's own picture and colour are kept; the controls below do nothing. On: the plug-in develops the DNG frames with them. |
+| Resolve Gamma | Develop RAW off only, for the Vignette Correction: the Gamma of Resolve's Camera RAW panel (Linear, 2.2, 2.4, 2.6, Rec.709, sRGB, Blackmagic Design Film, 4K Film, 4.6K Film, DaVinci Intermediate, ACEScct) |
 | Decode Quality | *Full Res.* (RCD demosaic) or *Half Res.* (2×2 binned, fastest) |
 | White Balance | As Shot, Daylight, Cloudy, Shade, Tungsten, Fluorescent, Flash, Custom. Editing *Color Temp* or *Tint* switches to Custom. |
 | Color Space | Rec.709, P3 D65, Rec.2020, DaVinci Wide Gamut, ACES AP0, ACES AP1 |
 | Gamma | Linear, 2.2, 2.4, Rec.709, sRGB, DaVinci Intermediate, ACEScct |
 | Exposure, Sharpness, Highlights, Shadows, Color Boost, Saturation, Midtones, Lift, Gain, Contrast | As in Resolve's CinemaDNG panel: same names, layout and ranges. The response is this plug-in's own, not Blackmagic's. |
 
+**Fit** and **Transform**
+
+| Control | What it does |
+|---|---|
+| Fit | How the picture maps onto the timeline frame: *Scale to Fit* (the whole picture, the default and what earlier versions did), *Fit Width* or *Fit Height*. A Transform zoom of 1 is this exact fit. |
+| Zoom X / Y, Link Zoom | Zoom about the anchor point; with Link Zoom on, Y follows X |
+| Position X / Y | Timeline pixels; positive moves right / up |
+| Rotation Angle | Degrees about the anchor point; positive turns anticlockwise |
+| Anchor Point X / Y | Timeline pixels from the frame centre (up positive): the point zoom, rotation, pitch and yaw turn about |
+| Pitch, Yaw | Degrees: the picture tilted / turned as a card seen in perspective |
+| Flip Horizontal / Vertical | Mirror the picture |
+
+Fit, Transform and the stabilisation are one resampling of the full-resolution developed frame, so framing in the plug-in
+costs no quality. That resampling uses a Lanczos-3 kernel, widened when the picture is made smaller so that it does not
+alias, and held to the neighbouring pixel values so that edges do not ring; it plays in real time on the GPU. Leave Resolve's own Transform (Edit page Inspector) and the Color page Sizing at their defaults: Resolve
+applies its input sizing before this node, where the plug-in replaces the picture, and any sizing after the node resamples
+the picture a second time. Render at the timeline resolution; delivering at another resolution makes Resolve scale the
+result once more.
+
+**Lens Correction**
+
+| Control | What it does |
+|---|---|
+| Correction | Read-only: what each correction uses for this clip |
+| Vignette Correction | Removes the lens's vignette (with Develop RAW on, also its colour shading). Off by default. |
+| Distortion Correction | Straightens the lens's distortion, in the same single resampling as the Transform and the stabilisation. Off by default. |
+| Vignette Profile, Distortion Profile | Empty: the lens's own profile from the clip, and when the clip has none, the Adobe lens profile installed on the computer for that lens. Or a file to use instead: a DNG shot with the same lens, an Adobe lens profile (`.lcp`) or a Lensfun file (`.xml`). |
+
+The camera writes the lens's profile into every frame for lenses with electronic contacts; the vignette only when its
+*Vignetting* compensation is set to *Auto*. Fisheye profiles are not supported, and lateral chromatic aberration is not corrected.
+
 **Stabilisation (gyro)**
 
 | Control | What it does |
 |---|---|
 | Gyro | Read-only status: the gyro data in use, or why stabilisation is off |
-| Stabilisation | On by default; does nothing on clips without gyro data |
+| Stabilisation | Off by default; does nothing on clips without gyro data |
 | Smoothness | Seconds of camera-path smoothing. 0 corrects the rolling shutter only; large values lock the shot. |
 | Rolling Shutter Correction | 0 to 1; 1 corrects every sensor row for the time it was read |
 | Rolling Shutter ms, Focal Length (mm) | Filled in from the clip; type a value to override it (needed for manual lenses) |
@@ -114,10 +148,11 @@ How the sync, the rolling-shutter model and the zoom work, with measurements, is
 
 ## Limits
 
-- Lens corrections stored in the DNG (opcode lists) are not applied, and there is no noise reduction; use Resolve's.
+- There is no noise reduction; use Resolve's.
+- With Develop RAW off, Resolve's picture at the timeline resolution is resampled once more (slightly softer than the plug-in's own development), and the colour shading and the 3K fixes are not applied.
 - Retimed clips and compound clips are not verified; frames map one to one to source frames.
 - The plug-in needs the clip's file path from Resolve, which it gets on the Color page. On the Fusion page it shows an error.
-- Gyro stabilisation uses a pinhole model: lens distortion is not corrected.
+- Gyro stabilisation uses a pinhole model: switch Distortion Correction on for wide lenses.
 
 ## Troubleshooting
 

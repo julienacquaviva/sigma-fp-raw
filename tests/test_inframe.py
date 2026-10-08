@@ -26,10 +26,14 @@ sys.path.insert(0, str(HERE))
 import make_inframe_clip as M  # noqa: E402
 from ofx_host import OFXHost, OK  # noqa: E402
 
+# The values these tests were written for (the defaults until 1.5.1; since 1.6.0: off, 0.1 s, Dynamic).
+STAB_TEST = dict(stabEnable=1, stabSmoothness=0.5, stabZoomMode=0, developRaw=1)   # and the plug-in's own development (off by default since 1.9.2)
+
 PLUGIN = ROOT / 'dist/SigmaFpRaw.ofx.bundle/Contents/Win64/SigmaFpRaw.ofx'
 CLI = ROOT / 'build/sfp_cli.exe'
 SAMPLE = HERE / 'data/A001_092.FPG'
 HEADER = HERE / 'data/frame_header.bin'
+HEADER_R122 = HERE / 'data/frame_header_r122.bin'   # a real R122 MQ 50 frame header (A001_007), block included
 SCRATCH = HERE / 'scratch'
 ARGS = [a for a in sys.argv[1:] if not a.startswith('--')]
 KEEP = '--keep' in sys.argv
@@ -157,7 +161,7 @@ def main():
     pts = float(np.abs(np.array(a['points']) - np.array(ref['points'])).max())
     assert dt < 2e-6 and track < 1e-3 and virt < 1e-3 and pts < 0.01, (dt, track, virt, pts)
     assert np.all(pa[:, 10] == 1)
-    assert a['status'].startswith('On | gyro: 292 frames, in-frame, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2812 px'), a['status']
+    assert a['status'].startswith('On | gyro: 292 frames, in-frame, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2520 px'), a['status']
     d0 = gyro(first, 'frame=100')
     assert d0['zoom'] == gyro(SAMPLE, 'frame=100', f'clip={N}')['zoom'] and 'ends at' not in d0['status']
     ok('in-frame track = .FPG track (292 frames): rate, frame times, orientations, virtual camera, warp',
@@ -315,6 +319,12 @@ def main():
     assert 'fewer than two frames carry gyro data' in gyro(paths[0])['error']
     ok('mixed clips: other take, leading frames without blocks, sidecar fallback, frames before sidecar, nothing, one block', **mixed)
 
+    # -- 9a. image scale from the sensor window (R122, R123, R124) --
+    window_tests(tmp, ok, h, table, samples)
+
+    # -- 9a2. real frames on the camera SSD (read-only): binning per clip, a damaged frame --
+    e_drive_checks(ok, skip)
+
     # -- 9b. blocks written by the firmware itself (R112 frame hook, emulated) --
     firmware_check(tmp, ok, skip)
 
@@ -350,6 +360,135 @@ def main():
     (ROOT / 'tests/inframe_report.json').write_text(json.dumps({'plugin': str(PLUGIN), 'clip': str(CLIP), 'tests': report}, indent=2) + '\n')
     done = sum(1 for r in report if r.get('passed'))
     print(f'ALL PASS ({done})' + (f', {len(report) - done} skipped' if done != len(report) else ''))
+
+
+R124_MODES = [   # mode, DC, rates, window, recorded, crop code, readout us (FPGYRO_INFRAME.md section 7)
+    ('3:2', 0, '<=29.97', (6000, 4000), (3840, 2560), 0, 24700), ('3:2', 1, '<=29.97', (4024, 2682), (3840, 2560), 1, 16600),
+    ('3:2', 1, '48/50', (4024, 2682), (3000, 2000), 1, 16600), ('16:9', 0, '<=29.97', (6000, 3375), (3840, 2160), 0, 20900),
+    ('16:9', 1, '<=29.97', (4216, 2372), (3840, 2160), 1, 14700), ('16:9', 1, '48/50', (4216, 2372), (3200, 1800), 1, 14700),
+    ('2:1', 0, '<=29.97', (6000, 3000), (4320, 2160), 0, 18500), ('2:1', 0, '48/50', (6000, 3000), (3600, 1800), 0, 18500),
+    ('2:1', 1, '<=29.97', (4320, 2160), (4320, 2160), 1, 13400), ('2:1', 1, '48/50', (4320, 2160), (3600, 1800), 1, 13400),
+    ('M43', 0, '<=50', (3000, 2000), (3000, 2000), 2, 12400), ('S16', 0, '<=50', (2288, 1526), (2160, 1440), 2, 9400)]
+
+
+def small_clip(name, header, frames=12, **block):
+    """A few header-only frames with blocks made from the sample track; block = make_block fields."""
+    h, table, samples = M.read_fpg(SAMPLE)
+    out = SCRATCH / name
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    paths = []
+    for i in range(frames):
+        start = int(table[i - 1]) if i else int(table[0]) - 500
+        blk = M.make_block(i, 1000000 + int(round(table[i] / h['rate'] * 1e6)), samples[start:int(table[i])], flags=0 if i else 1, **block)
+        d = bytearray(Path(header).read_bytes())
+        at, _ = M.layout(d)
+        d[at:at + M.REGION] = bytes(M.REGION)                 # a fixture may carry a block of its own
+        d[at:at + len(blk)] = blk
+        paths.append(out / f'{name}_20261003_{i + 1:06d}.DNG')
+        paths[-1].write_bytes(d)
+    return paths
+
+
+def window_tests(tmp, ok, h, table, samples):
+    os.environ['SFP_GYRO_CACHE_DIR'] = 'off'
+    # R124: the trailer carries the window and the recorded size.
+    rows = {}
+    for k, (mode, dc, rate, win, rec, crop, ro) in enumerate(R124_MODES):
+        paths = small_clip(f'W124_{k:02d}', HEADER, readout_us=ro, mark_delay_us=ro // 2 + 5000, sensor_mode=121 if rate == '48/50' else 3,
+                           resolution={'3:2': 6, '16:9': 3, '2:1': 4, 'M43': 2, 'S16': 8}[mode], dc_crop=crop, trailer=(*win, *rec))
+        b = cli('fpg2', paths[1])
+        assert (b['window'], b['recorded'], b['dc_crop'], b['readout_us']) == (list(win), list(rec), crop, ro), b
+        j = gyro(paths[0])
+        want = 28.0 / (0.006 * win[0] / rec[0])
+        assert j['window'] == list(win) and j['recorded'] == list(rec) and j['window_source'] == 1 and abs(j['focal_px'] - want) < 1e-3, (mode, j['focal_px'], want)
+        assert (f'(sensor window {win[0]}x{win[1]})' in j['status']) == (win[0] != 6000), j['status']
+        rows[f'{mode} DC{dc} {rate}'] = round(j['focal_px'], 1)
+    ok('R124: image scale from the window and recorded size in the block, every mode and rate group (focal px at 28 mm)', **rows)
+    # R123 (crop code 2) and R122 (crop code 0, readout 18926 us) MQ 50 frames: the 4608 x 3072 window.
+    r122 = cli('fpg2', HEADER_R122)
+    assert (r122['present'], r122['readout_us'], r122['sensor_mode'], r122['resolution'], r122['dc_crop'], r122['window']) == (1, 18926, 121, 2, 0, [0, 0]), r122
+    found = {}
+    for name, crop, ro, want_src, want_w in (('W123', 2, 18926, 2, 4608), ('W122', 0, 18926, 3, 4608), ('WMQ', 0, 12423, 0, 6000)):
+        paths = small_clip(name, HEADER_R122, readout_us=ro, mark_delay_us=ro // 2 + 5000, sensor_mode=121 if ro == 18926 else 98,
+                           resolution=2, dc_crop=crop)
+        j = gyro(paths[0])
+        assert j['raster'] == [3024, 2010] and j['recorded'] == [3000, 2000], j
+        assert j['window'][0] == want_w and j['window_source'] == want_src and abs(j['focal_px'] - 28 / (0.006 * want_w / 3000)) < 1e-3, (name, j['window'], j['focal_px'])
+        found[name] = (j['window'], round(j['focal_px'], 1), j['status'])
+    assert '(sensor window 4608x3072, MQ 50, recognised by its readout)' in found['W122'][2]
+    assert '(sensor window 4608x3072, MQ 50),' in found['W123'][2] and 'sensor window' not in found['WMQ'][2]
+    # An older DC Crop block (crop code 1, no trailer): the 1.49 crop.
+    paths = small_clip('WDC', HEADER, readout_us=20000, mark_delay_us=15000, dc_crop=1)
+    j = gyro(paths[0])
+    assert j['window'] == [4024, 2682] and abs(j['focal_px'] - 28 / (0.006 * 4024 / 3240)) < 1e-3 and '(sensor window 4024x2682, DC Crop)' in j['status']
+    ok('R123 (crop code 2) and R122 (readout 18926 us + MQ size) give the 4608 x 3072 window; plain MQ and older DC Crop as before',
+       r123=found['W123'][:2], r122=found['W122'][:2], plain_mq=found['WMQ'][:2], older_dc_crop=[j['window'], round(j['focal_px'], 1)])
+    # Row Phase and Edge Anti-aliasing: only for the 2x2 binned readout (M98), not for 1:1 windows of the same 3024x2010 size.
+    binning = {}
+    for name, header, block, want in (
+            ('B122', HEADER_R122, dict(readout_us=18926, sensor_mode=121, resolution=2, dc_crop=0), 0),
+            ('B123', HEADER_R122, dict(readout_us=18926, sensor_mode=121, resolution=2, dc_crop=2), 0),
+            ('B124', HEADER_R122, dict(readout_us=12400, sensor_mode=3, resolution=2, dc_crop=2, trailer=(3000, 2000, 3000, 2000)), 0),
+            ('B124DC', HEADER_R122, dict(readout_us=16600, sensor_mode=121, resolution=6, dc_crop=1, trailer=(4024, 2682, 3000, 2000)), 0),
+            ('BM98', HEADER_R122, dict(readout_us=12423, sensor_mode=98, resolution=2, dc_crop=0), 1),
+            ('BHQ', HEADER, dict(readout_us=24833, sensor_mode=3, resolution=4, dc_crop=0), 0)):
+        j = gyro(small_clip(name, header, **block)[0])
+        assert j['binned'] == want, (name, j['binned'], j['binned_why'])
+        binning[name] = f"{j['binned']}: {j['binned_why']}"
+    ok('Row Phase + Edge Anti-aliasing decided from the gyro block: on for the 2x2 binned M98 readout only', **binning)
+
+    # The real R122 clip, if the SSD is connected.
+    clip = Path(os.environ.get('SFP_R122_CLIP', 'E:/CINEMA/A001_007'))
+    frames = sorted(clip.glob('*.DNG')) if clip.is_dir() else []
+    if len(frames) < 100:
+        print('SKIP real R122 clip -', clip, 'is not connected')
+    else:
+        j = gyro(frames[0])
+        assert (j['window'], j['window_source'], j['readout_us'], j['sensor_mode']) == ([4608, 3072], 3, 18926, 121), j
+        assert abs(j['focal_px'] - 28 / (0.006 * 4608 / 3000)) < 1e-3 and '(sensor window 4608x3072, MQ 50, recognised by its readout)' in j['status']
+        ok(f'{clip.name} (R122, MQ 50): window recognised from its blocks', frames=j['frames'], focal_px=j['focal_px'], status=j['status'][:150])
+    os.environ['SFP_GYRO_CACHE_DIR'] = str(tmp / 'cache')
+
+
+def e_drive_checks(ok, skip):
+    root = Path(os.environ.get('SFP_E_CINEMA', 'E:/CINEMA'))
+    clips = {n: sorted((root / n).glob('*.DNG')) for n in ('A001_004', 'A001_005', 'A001_007')}
+    if any(len(v) < 50 for v in clips.values()):
+        return skip('camera SSD clips: binning and a damaged frame', f'{root} does not hold A001_004 / A001_005 / A001_007')
+    os.environ['SFP_GYRO_CACHE_DIR'] = 'off'
+
+    def host_for(frames):
+        host = OFXHost(PLUGIN, canvas=(1504, 1000))
+        host.set(**STAB_TEST)
+        source(host, frames[0])
+        host.set(decodeQuality=1, stabEnable=0)
+        return host
+    res = {}
+    for name, on in (('A001_004', True), ('A001_007', False)):
+        host = host_for(clips[name])
+        info = host.get('info')
+        st, a = host.render(source_frame=20)
+        host.set(rowPhase=0.0, deZigzag=0.0)
+        st2, b = host.render(source_frame=20)
+        host.close()
+        assert st == OK and st2 == OK and (not np.array_equal(a.pixels, b.pixels)) == on, (name, info)
+        assert info.endswith('Row Phase + Edge Anti-aliasing on: 2x2 binned readout (M98)' if on else
+                             'Row Phase + Edge Anti-aliasing off: 1:1 sensor window (MQ 50, R122 readout)'), info
+        res[name] = info.split(' | ')[-1]
+    ok('A001_004 (old MQ, M98): corrections on; A001_007 (R122 MQ 50 window): off, the picture equals Row Phase 0 / Anti-aliasing 0', **res)
+    # A001_005 frame 2: tile 4 of its LJ92 data is damaged in camera.
+    host = host_for(clips['A001_005'])
+    st, bad = host.render(source_frame=1)
+    msg = host.messages[-1]
+    st2, prev = host.render(source_frame=0)
+    host.close()
+    assert st == OK and st2 == OK and np.array_equal(bad.pixels, prev.pixels), host.messages[-3:]
+    assert msg['type'] == 'OfxMessageWarning' and 'frame 2 cannot be decoded (Tile 4: LJ92:' in msg['text'] and 'showing frame 1 instead' in msg['text'], msg
+    r = subprocess.run([str(CLI), 'develop', str(clips['A001_005'][1]), str(Path(tempfile.gettempdir()) / 'sfp_bad.tif'), 'width=64', 'height=43'],
+                       capture_output=True, text=True)
+    assert 'damaged data' in r.stdout, r.stdout
+    ok('A001_005 frame 2 (damaged LJ92 tile in camera): the plug-in shows frame 1 with a warning instead of failing', warning=msg['text'])
 
 
 def firmware_frames():
@@ -458,6 +597,7 @@ def background_status(ok):
     os.environ['SFP_GYRO_CACHE_DIR'] = 'off'
     os.environ['SFP_GYRO_SCAN_DELAY_US'] = '250000'          # as if the frames were on slow media: about 2 s for the clip
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
+    host.set(**STAB_TEST)
     t0 = time.time()
     source(host, first)
     took = time.time() - t0
@@ -468,7 +608,7 @@ def background_status(ok):
     seen = wait_ready(host)
     percents = [int(s.split()[2]) for s in seen if s.startswith('Loading')]
     assert percents == sorted(percents) and percents[-1] > 0, seen
-    assert seen[-1].startswith('On | gyro: 292 frames, in-frame, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2812 px, zoom 1.300'), seen[-1]
+    assert seen[-1].startswith('On | gyro: 292 frames, in-frame, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2520 px, zoom 1.300'), seen[-1]
     assert (host.get('stabFocal'), host.get('stabReadout')) == (28.0, 24.8)        # prefilled once the data is there
     host.set(stabEnable=0)
     host.changed('stabEnable')
@@ -477,6 +617,7 @@ def background_status(ok):
     os.environ.pop('SFP_GYRO_SCAN_DELAY_US')
     # Second instance on the same clip in the same session after an unload: scanned again, at once without the delay.
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
+    host.set(**STAB_TEST)
     source(host, first)
     assert host.get('stabStatus').startswith('On | gyro: 292 frames, in-frame'), host.get('stabStatus')
     host.close()
@@ -494,6 +635,7 @@ def real_frames(frames, fpg, tmp, ok):
 
     def render(**values):
         host = OFXHost(PLUGIN, canvas=(1620, 1080))
+        host.set(**STAB_TEST)
         source(host, paths[0])
         host.set(decodeQuality=1, **values)
         host.changed('gyroFile')
@@ -522,6 +664,7 @@ def real_frames(frames, fpg, tmp, ok):
     # Rendering does not wait for the scan: frames are unstabilised until the track is ready.
     os.environ['SFP_GYRO_SCAN_DELAY_US'] = '500000'
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
+    host.set(**STAB_TEST)
     source(host, paths[0])
     host.set(decodeQuality=1)
     t0 = time.time()

@@ -25,6 +25,7 @@ struct StabParams {
     float rows;           // raster rows covered by the readout
     float invZoom;        // 1 / (auto zoom * manual zoom)
     float rot[STAB_KNOTS * 9];
+    float row0;           // raster row the readout starts at (0, except for a picture placed inside a larger image)
 };
 
 #ifdef __CUDACC__
@@ -41,7 +42,7 @@ SFP_FN void stab_map(const StabParams& s, float x, float y, float* ox, float* oy
     float px = (x - s.cx) * s.invZoom, py = (y - s.cy) * s.invZoom, pz = s.focal;
     float sx = x, sy = y;
     for (int it = 0; it < 3; ++it) {
-        float kf = sy / s.rows * (float)(STAB_KNOTS - 1);
+        float kf = (sy - s.row0) / s.rows * (float)(STAB_KNOTS - 1);
         kf = kf < 0.f ? 0.f : (kf > (float)(STAB_KNOTS - 1) ? (float)(STAB_KNOTS - 1) : kf);
         int k = (int)kf;
         if (k > STAB_KNOTS - 2) k = STAB_KNOTS - 2;
@@ -59,6 +60,34 @@ SFP_FN void stab_map(const StabParams& s, float x, float y, float* ox, float* oy
     }
     *ox = sx; *oy = sy;
 }
+
+// Lens distortion (the DNG's WarpRectilinear opcode, as the camera writes it from the lens's own
+// data): a position of the corrected picture -> where the lens put it in the recorded frame.
+struct LensParams {
+    int on;           // 0 = no correction
+    float cx, cy;     // optical centre, raster coordinates
+    float m, invM;    // normalisation radius (centre to the farthest corner of the area the profile is for), raster pixels
+    float c[7];       // radial factor: sum of c[i] r^i
+};
+
+SFP_FN void lens_map(const LensParams& l, float x, float y, float* ox, float* oy) {
+    const float dx = (x - l.cx) * l.invM, dy = (y - l.cy) * l.invM;
+    const float r = sqrtf(dx * dx + dy * dy);
+    const float f = l.c[0] + r * (l.c[1] + r * (l.c[2] + r * (l.c[3] + r * (l.c[4] + r * (l.c[5] + r * l.c[6])))));
+    *ox = l.cx + dx * f * l.m;
+    *oy = l.cy + dy * f * l.m;
+}
+
+// Vignette correction of the host's own picture (Develop RAW off): a radial brightness gain
+// 1 + sum a[n] r^(2n+2), applied in linear light; the picture is taken out of and put back into
+// its encoding (gamma: the ids of pt_decode in kernels.cu).
+struct VignetteParams {
+    int on;
+    float cx, cy;     // the sensor's centre in the picture, plane pixels
+    float invR;       // 1 / the sensor's half diagonal in plane pixels
+    float a[4];
+    int gamma;
+};
 
 struct DevelopParams {
     int W, H;                         // raw dimensions
@@ -80,7 +109,32 @@ struct DevelopParams {
     float lift, gain;
     float pedestal;   // removed after sampling the demosaiced planes
     StabParams stab;  // gyro stabilisation (stab.on == 0: none)
+    int rodW;         // region of definition width (the timeline frame at render scale)
+    int xform;        // 1: the Transform controls are not neutral, xf is used
+    float xf[9];      // output -> fitted frame, both centred with y up (homogeneous 3x3, row major)
+    int resampler;    // 0 bilinear, 1 Catmull-Rom, 2 Lanczos-2, 3 Lanczos-3
+    float kx, ky;     // source pixels per output pixel along x / y (>= 1): the kernel is widened by it
+    LensParams lens;  // lens distortion correction (lens.on == 0: none), after the stabilisation's map
+    int passthrough;  // 1: the planes hold the host's own picture; it is resampled and written as it is (no development)
+    VignetteParams vig;   // pass-through only
 };
+
+enum { kResampleBilinear = 0, kResampleCatmullRom = 1, kResampleLanczos2 = 2, kResampleLanczos3 = 3 };
+
+// The Transform controls: from an output position (RoD pixel coordinates, y down, pixel centres
+// at +0.5) to the position in the fitted (untransformed) frame. False when the point lies
+// behind the viewer (pitch / yaw beyond 90 degrees). One mapping for the GPU, the processor and
+// the tests, so the picture is resampled once, wherever it is computed.
+SFP_FN bool xform_map(const DevelopParams& p, float ix, float iy, float* ox, float* oy) {
+    const float u = ix - 0.5f * (float)p.rodW, v = 0.5f * (float)p.rodH - iy;
+    const float X = p.xf[0] * u + p.xf[1] * v + p.xf[2];
+    const float Y = p.xf[3] * u + p.xf[4] * v + p.xf[5];
+    const float W = p.xf[6] * u + p.xf[7] * v + p.xf[8];
+    if (W <= 1e-6f) return false;
+    *ox = X / W + 0.5f * (float)p.rodW;
+    *oy = 0.5f * (float)p.rodH - Y / W;
+    return true;
+}
 
 struct DezigParams {
     int W, H;

@@ -113,12 +113,12 @@ struct State {
 }  // namespace cpu
 
 bool develop_cpu(const Frame& f, int quality, const PrepParams& pp, float dz, const DevelopParams& dp, void* out,
-                 std::string& e, DevelopTiming* timing) {
+                 std::string& e, DevelopTiming* timing, const void* source, int sourceRowBytes) {
     using namespace cpu;
     static State* st = new State;   // kept for the life of the process (no thread joins at unload)
     State& x = *st;
     std::lock_guard<std::mutex> lock(x.m);
-    const int W = pp.W, H = pp.H;
+    const int W = source ? dp.W : pp.W, H = source ? dp.H : pp.H;
     const size_t n = static_cast<size_t>(W) * H;
     const auto t0 = std::chrono::steady_clock::now();
     try {
@@ -133,8 +133,14 @@ bool develop_cpu(const Frame& f, int quality, const PrepParams& pp, float dz, co
         e = "Not enough memory";
         return false;
     }
-    const bool reuse = x.valid && x.frameId == f.id && x.quality == quality && x.lastDezig == dz && !std::memcmp(&x.last, &pp, sizeof pp);
-    if (!reuse) {
+    const bool reuse = !source && x.valid && x.frameId == f.id && x.quality == quality && x.lastDezig == dz && !std::memcmp(&x.last, &pp, sizeof pp);
+    if (source) {
+        x.valid = false;
+        const float* in = static_cast<const float*>(source);
+        float *R = x.R.data(), *G = x.G.data(), *B = x.B.data();
+        each_pixel(x.pool, W, H, [&](int px, int py) { k_unpack(px, py, in, R, G, B, W, H, sourceRowBytes); });
+        x.planes[0] = R; x.planes[1] = G; x.planes[2] = B;
+    } else if (!reuse) {
         x.valid = false;
         const unsigned short* src = f.raw.data();
         float *cfa = x.cfa.data(), *vh = x.vh.data(), *lpf = x.lpf.data(), *pq = x.pq.data();

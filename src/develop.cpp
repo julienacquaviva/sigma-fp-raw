@@ -22,15 +22,16 @@ namespace sfp {
 // 3K frames (sensor mode M98, /2 binned readout) are the only ones with the row-pair
 // offset and its stair-step aliasing; both corrections apply to them only.
 static bool is_3k(const DngInfo& info) { return info.width == 3024 && info.height == 2010; }
+static bool binned_3k(const RawSettings& s, const DngInfo& info) { return is_3k(info) && s.binned != 0; }
 
 double effective_row_phase(const RawSettings& s, const DngInfo& info) {
     // G2/B rows sit 0.5 px off the Bayer grid (A001_065 raw: G2-G1 +0.51 px);
     // recommended -0.125 plane pitch re-spaces the row pairs.
-    return is_3k(info) ? std::clamp(s.rowPhase, -0.5, 0.5) : 0.0;
+    return binned_3k(s, info) ? std::clamp(s.rowPhase, -0.5, 0.5) : 0.0;
 }
 
 double effective_dezigzag(const RawSettings& s, const DngInfo& info) {
-    return is_3k(info) ? std::clamp(s.deZigzag, 0.0, 100.0) : 0.0;
+    return binned_3k(s, info) ? std::clamp(s.deZigzag, 0.0, 100.0) : 0.0;
 }
 
 bool preset_temp_tint(WhiteBalance wb, double& temp, double& tint) {
@@ -50,7 +51,9 @@ namespace {
 struct Ctx {
     CUcontext ctx = nullptr;
     CUmodule mod = nullptr;
-    CUfunction hot, prep, vh, lpf, green, pq, rbDiag, rbG, half, tensor, blur3, dezig, dev;
+    CUfunction hot, prep, vh, lpf, green, pq, rbDiag, rbG, half, tensor, blur3, dezig, dev, unpack;
+    CUdeviceptr src = 0;         // the host's picture, uploaded (pass-through with host images)
+    size_t srcCap = 0;
     CUdeviceptr T[6] = {0, 0, 0, 0, 0, 0};   // structure tensor planes (+ blur temp)
     CUdeviceptr planes[3] = {0, 0, 0};   // develop input (demosaic or de-zigzag output)
     float lastDezig = -1;
@@ -102,7 +105,7 @@ struct Developer::Impl {
         }
         struct { CUfunction* f; const char* n; } fns[] = {
             {&x->hot, "k_hot"}, {&x->prep, "k_prep"}, {&x->vh, "k_vh"}, {&x->lpf, "k_lpf"}, {&x->green, "k_green"}, {&x->pq, "k_pq"},
-            {&x->rbDiag, "k_rb_diag"}, {&x->rbG, "k_rb_g"}, {&x->half, "k_half"}, {&x->tensor, "k_tensor"}, {&x->blur3, "k_blur3"}, {&x->dezig, "k_dezig"}, {&x->dev, "k_develop"}};
+            {&x->rbDiag, "k_rb_diag"}, {&x->rbG, "k_rb_g"}, {&x->half, "k_half"}, {&x->tensor, "k_tensor"}, {&x->blur3, "k_blur3"}, {&x->dezig, "k_dezig"}, {&x->dev, "k_develop"}, {&x->unpack, "k_unpack"}};
         for (auto& f : fns)
             if (!check(cu.cuModuleGetFunction(f.f, x->mod, f.n), f.n, e)) { ctxs.erase(c); return nullptr; }
         slot = std::move(x);
@@ -117,8 +120,138 @@ Developer& Developer::get() {
 }
 const char* Developer::backend() { return os::env("SFP_CPU") != "1" && cuda().ok ? "CUDA (GPU)" : "CPU"; }
 
+// The brightness plane of a shading map (over the whole 6048 x 4032 sensor) as a radial gain
+// 1 + a0 r^2 + a1 r^4 + a2 r^6 + a3 r^8, r = 1 at the sensor's corner (least squares).
+static void fit_vignette(const GainMap& g, float a[4]) {
+    double M[4][5] = {};
+    const double R2 = 0.25 * (6048.0 * 6048.0 + 4032.0 * 4032.0);
+    for (int i = 0; i < g.rows; ++i)
+        for (int j = 0; j < g.cols; ++j) {
+            const double x = (static_cast<double>(j) / (g.cols - 1) - 0.5) * 6048, y = (static_cast<double>(i) / (g.rows - 1) - 0.5) * 4032;
+            const double r2 = (x * x + y * y) / R2;
+            const double b = g.gain[(static_cast<size_t>(i) * g.cols + j) * g.planes + (g.planes == 3 ? 1 : 0)] - 1.0;
+            double basis[4] = {r2, r2 * r2, r2 * r2 * r2, r2 * r2 * r2 * r2};
+            for (int u = 0; u < 4; ++u) {
+                for (int v = 0; v < 4; ++v) M[u][v] += basis[u] * basis[v];
+                M[u][4] += basis[u] * b;
+            }
+        }
+    for (int c = 0; c < 4; ++c) {   // Gauss-Jordan with pivoting
+        int piv = c;
+        for (int r = c + 1; r < 4; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+        for (int k = 0; k < 5; ++k) std::swap(M[c][k], M[piv][k]);
+        if (std::fabs(M[c][c]) < 1e-18) { for (int k = 0; k < 4; ++k) a[k] = 0; return; }
+        for (int r = 0; r < 4; ++r) {
+            if (r == c) continue;
+            const double f = M[r][c] / M[c][c];
+            for (int k = c; k < 5; ++k) M[r][k] -= f * M[c][k];
+        }
+    }
+    for (int k = 0; k < 4; ++k) a[k] = static_cast<float>(M[k][4] / M[k][k]);
+}
+
+// Where an output position is read in the raster (the kernel's chain without the black borders).
+static void out_to_source(const DevelopParams& p, float ix, float iy, float& sx, float& sy) {
+    if (p.xform) xform_map(p, ix, iy, &ix, &iy);
+    sx = (ix - p.offX) / p.scaleX + p.cropX;
+    sy = (iy - p.offY) / p.scaleY + p.cropY;
+    if (p.stab.on) stab_map(p.stab, sx, sy, &sx, &sy);
+    if (p.lens.on) lens_map(p.lens, sx, sy, &sx, &sy);
+}
+
+// The kernel and how far it must be widened: source pixels per output pixel at the frame
+// centre (the fit, the Transform zoom, the stabiliser's zoom; perspective and rolling shutter
+// change it only a little across the frame).
+void resample_scale(const RawSettings& s, DevelopParams& p) {
+    p.resampler = std::clamp(s.resampler, 0, 3);
+    p.kx = p.ky = 1.f;
+    if (p.resampler == kResampleBilinear) return;
+    const float cx = 0.5f * p.rodW, cy = 0.5f * p.rodH;
+    float x0, y0, x1, y1, x2, y2;
+    out_to_source(p, cx, cy, x0, y0);
+    out_to_source(p, cx + 1.f, cy, x1, y1);
+    out_to_source(p, cx, cy + 1.f, x2, y2);
+    const float kx = std::sqrt((x1 - x0) * (x1 - x0) + (x2 - x0) * (x2 - x0));
+    const float ky = std::sqrt((y1 - y0) * (y1 - y0) + (y2 - y0) * (y2 - y0));
+    // Within 0.1 % of 1:1 counts as 1:1 (the finite differences are not exact).
+    p.kx = std::isfinite(kx) && kx > 1.001f ? std::min(kx, 16.f) : 1.f;
+    p.ky = std::isfinite(ky) && ky > 1.001f ? std::min(ky, 16.f) : 1.f;
+}
+
+void frame_geometry(int cropW, int cropH, const RawSettings& s, const Target& t, DevelopParams& dp) {
+    dp.cropW = cropW; dp.cropH = cropH;
+    dp.rodW = t.rodW; dp.rodH = t.rodH;
+    double sx = static_cast<double>(t.rodW) / cropW, sy = static_cast<double>(t.rodH) / cropH;
+    switch (s.fit) {
+        case Fit::Fill: sx = sy = std::max(sx, sy); break;
+        case Fit::Stretch: break;
+        case Fit::Native: sx = s.renderScaleX; sy = s.renderScaleY; break;
+        case Fit::FitWidth: sx = sy = (t.compW > 0 ? t.compW : t.rodW) / cropW; break;
+        case Fit::FitHeight: sx = sy = (t.compH > 0 ? t.compH : t.rodH) / cropH; break;
+        default: sx = sy = std::min(sx, sy); break;
+    }
+    dp.scaleX = static_cast<float>(sx);
+    dp.scaleY = static_cast<float>(sy);
+    dp.offX = static_cast<float>((t.rodW - cropW * sx) / 2);
+    dp.offY = static_cast<float>((t.rodH - cropH * sy) / 2);
+    dp.nearest = std::fabs(sx - 1) < 1e-6 && std::fabs(sy - 1) < 1e-6 &&
+                 std::fabs(dp.offX - std::round(dp.offX)) < 1e-4 && std::fabs(dp.offY - std::round(dp.offY)) < 1e-4;
+    if (dp.stab.on) dp.nearest = 0;
+    dp.xform = 0;
+    const Transform& x = s.xf;
+    if (x.neutral()) return;
+    // Forward: fitted frame -> output, both centred with y up, in render-scaled pixels:
+    // flip, then about the anchor: zoom, rotation, pitch and yaw (a card seen in perspective
+    // from a distance of one frame width), then the position.
+    const double rx = s.renderScaleX, ry = s.renderScaleY, pi = 3.14159265358979323846;
+    const double ax = x.anchorX * rx, ay = x.anchorY * ry;
+    auto mul = [](const double a[9], const double b[9], double o[9]) {
+        double r[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) r[3 * i + j] = a[3 * i] * b[j] + a[3 * i + 1] * b[3 + j] + a[3 * i + 2] * b[6 + j];
+        std::memcpy(o, r, sizeof r);
+    };
+    double m[9] = {x.flipH ? -1.0 : 1.0, 0, 0, 0, x.flipV ? -1.0 : 1.0, 0, 0, 0, 1};
+    const double toAnchor[9] = {1, 0, -ax, 0, 1, -ay, 0, 0, 1};
+    mul(toAnchor, m, m);
+    const double zoom[9] = {x.zoomX, 0, 0, 0, x.zoomY, 0, 0, 0, 1};
+    mul(zoom, m, m);
+    const double a = x.rotation * pi / 180, c = std::cos(a), sn = std::sin(a);
+    const double rot[9] = {c, -sn, 0, sn, c, 0, 0, 0, 1};
+    mul(rot, m, m);
+    if (x.pitch != 0 || x.yaw != 0) {
+        // The plane z = 0 turned about x (pitch: positive leans the top away) and then about y
+        // (yaw: positive turns the right side away), z pointing away from the viewer, seen from
+        // z = -D and projected back onto z = 0.
+        const double p = x.pitch * pi / 180, y = x.yaw * pi / 180, D = t.rodW;
+        const double cp = std::cos(p), sp = std::sin(p), cy = std::cos(y), sy2 = std::sin(y);
+        // columns: images of the x and y axes of the plane
+        const double X0 = cy, Y0 = 0, Z0 = sy2;                    // (1,0,0) -> about y
+        const double X1 = -sy2 * sp, Y1 = cp, Z1 = cy * sp;        // (0,1,0) -> about x, then y
+        const double persp[9] = {D * X0, D * X1, 0, D * Y0, D * Y1, 0, Z0, Z1, D};
+        mul(persp, m, m);
+    }
+    const double back[9] = {1, 0, ax + x.posX * rx, 0, 1, ay + x.posY * ry, 0, 0, 1};
+    mul(back, m, m);
+    // The kernel needs output -> fitted: the inverse.
+    const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+    if (std::fabs(det) < 1e-12) {   // zoom 0: nothing of the picture is left
+        const double none[9] = {0, 0, 1e9, 0, 0, 1e9, 0, 0, 1};
+        for (int i = 0; i < 9; ++i) dp.xf[i] = static_cast<float>(none[i]);
+    } else {
+        const double inv[9] = {(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det, (m[1] * m[5] - m[2] * m[4]) / det,
+                               (m[5] * m[6] - m[3] * m[8]) / det, (m[0] * m[8] - m[2] * m[6]) / det, (m[2] * m[3] - m[0] * m[5]) / det,
+                               (m[3] * m[7] - m[4] * m[6]) / det, (m[1] * m[6] - m[0] * m[7]) / det, (m[0] * m[4] - m[1] * m[3]) / det};
+        // Keep w positive in front of the viewer.
+        const double sgn = inv[8] < 0 ? -1.0 : 1.0;
+        for (int i = 0; i < 9; ++i) dp.xf[i] = static_cast<float>(sgn * inv[i]);
+    }
+    dp.xform = 1;
+    dp.nearest = 0;
+}
+
 bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, const Target& t,
-                        std::string& e, DevelopTiming* timing) {
+                        std::string& e, DevelopTiming* timing, const SourceImage* source) {
     const DngInfo& info = f.info;
     const int W = info.width, H = info.height;
     if (W < 16 || H < 16 || f.raw.size() != static_cast<size_t>(W) * H) { e = "Bad frame"; return false; }
@@ -154,21 +287,65 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
     // Host images may have padded or negative strides: develop packed, copy rows after.
     dp.rowBytes = t.device ? t.rowBytes : t.width * 16;   // (the CPU path writes the host rows directly)
     dp.boundsX = t.boundsX; dp.boundsY = t.boundsY; dp.rodH = t.rodH;
-    double sx = static_cast<double>(t.rodW) / dp.cropW, sy = static_cast<double>(t.rodH) / dp.cropH;
-    switch (s.fit) {
-        case Fit::Fill: sx = sy = std::max(sx, sy); break;
-        case Fit::Stretch: break;
-        case Fit::Native: sx = s.renderScaleX; sy = s.renderScaleY; break;
-        default: sx = sy = std::min(sx, sy); break;
-    }
-    dp.scaleX = static_cast<float>(sx);
-    dp.scaleY = static_cast<float>(sy);
-    dp.offX = static_cast<float>((t.rodW - dp.cropW * sx) / 2);
-    dp.offY = static_cast<float>((t.rodH - dp.cropH * sy) / 2);
-    dp.nearest = std::fabs(sx - 1) < 1e-6 && std::fabs(sy - 1) < 1e-6 &&
-                 std::fabs(dp.offX - std::round(dp.offX)) < 1e-4 && std::fabs(dp.offY - std::round(dp.offY)) < 1e-4;
     dp.stab = s.stab;
-    if (dp.stab.on) dp.nearest = 0;
+    if (const LensWarp* w = s.lensDistortion && s.lensProfile.valid ? &s.lensProfile : nullptr) {
+        // The profile's radius is in pixels of the whole sensor (6048 x 4032); a frame from a
+        // smaller sensor window shows its middle, at the frame's own scale.
+        const double scale = info.cropW / (6048.0 * std::clamp(f.profileW, 0.05, 1.0));   // frame pixels per sensor pixel
+        const double m = (w->radius > 0 ? w->radius : 0.5 * std::sqrt(6048.0 * 6048.0 + 4032.0 * 4032.0)) * scale;
+        dp.lens.on = 1;
+        dp.lens.cx = static_cast<float>(info.activeLeft + info.cropX + w->cx * info.cropW);
+        dp.lens.cy = static_cast<float>(info.activeTop + info.cropY + w->cy * info.cropH);
+        dp.lens.m = static_cast<float>(m);
+        dp.lens.invM = static_cast<float>(1.0 / m);
+        for (int i = 0; i < 7; ++i) dp.lens.c[i] = static_cast<float>(w->c[i]);
+    }
+    if (source) {
+        // The planes are the host's picture; the clip's frame sits in it scaled to fit and
+        // centred. Everything measured in raster pixels moves to that picture's pixels.
+        if (source->width <= 0 || source->height <= 0 || source->rodW <= 0 || source->rodH <= 0 || (!source->device && !source->host)) { e = "Bad source image"; return false; }
+        const double k = std::min(static_cast<double>(source->rodW) / info.cropW, static_cast<double>(source->rodH) / info.cropH);
+        const double picW = info.cropW * k, picH = info.cropH * k;
+        const double px0 = (source->rodW - picW) / 2 - source->offX, py0 = (source->rodH - picH) / 2 - source->offTop;
+        const double rcx = info.activeLeft + info.cropX, rcy = info.activeTop + info.cropY;
+        dp.W = source->width; dp.H = source->height;
+        dp.cropX = std::clamp(static_cast<int>(std::lround(px0)), 0, dp.W - 1);
+        dp.cropY = std::clamp(static_cast<int>(std::lround(py0)), 0, dp.H - 1);
+        dp.cropW = std::clamp(static_cast<int>(std::lround(picW)), 1, dp.W - dp.cropX);
+        dp.cropH = std::clamp(static_cast<int>(std::lround(picH)), 1, dp.H - dp.cropY);
+        if (dp.stab.on) {
+            dp.stab.focal *= static_cast<float>(k);
+            dp.stab.cx = static_cast<float>(px0 + (dp.stab.cx - rcx) * k);
+            dp.stab.cy = static_cast<float>(py0 + (dp.stab.cy - rcy) * k);
+            dp.stab.rows *= static_cast<float>(k);
+            dp.stab.row0 = static_cast<float>(py0 - rcy * k);
+        }
+        if (dp.lens.on) {
+            dp.lens.cx = static_cast<float>(px0 + (dp.lens.cx - rcx) * k);
+            dp.lens.cy = static_cast<float>(py0 + (dp.lens.cy - rcy) * k);
+            dp.lens.m *= static_cast<float>(k);
+            dp.lens.invM = 1.f / dp.lens.m;
+        }
+        dp.passthrough = 1;
+        if (s.sourceVignette.valid()) {
+            // The sensor's centre is the picture's centre; its half diagonal in this picture's pixels.
+            const double perSensorPx = k * info.cropW / (6048.0 * std::clamp(f.profileW, 0.05, 1.0));
+            dp.vig.on = 1;
+            dp.vig.cx = static_cast<float>(px0 + picW / 2);
+            dp.vig.cy = static_cast<float>(py0 + picH / 2);
+            dp.vig.invR = static_cast<float>(1.0 / (0.5 * std::sqrt(6048.0 * 6048.0 + 4032.0 * 4032.0) * perSensorPx));
+            fit_vignette(s.sourceVignette, dp.vig.a);
+            dp.vig.gamma = std::clamp(s.sourceGamma, 0, 10);
+            dp.nearest = 0;
+        }
+    }
+    frame_geometry(dp.cropW, dp.cropH, s, t, dp);
+    if (dp.lens.on) dp.nearest = 0;
+    if (!source) {
+        dp.cropX = info.activeLeft + info.cropX;
+        dp.cropY = info.activeTop + info.cropY;
+    }
+    resample_scale(s, dp);
     dp.sharpen = static_cast<float>(std::clamp(s.sharpness, 0.0, 100.0) / 100.0 * 2.0);
     dp.norm = norm;
     dp.clip = std::min({cs.wb[0], cs.wb[1], cs.wb[2]});
@@ -194,9 +371,11 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
     // Without an NVIDIA CUDA driver (or with SFP_CPU=1) host images are developed on the CPU.
     static const bool forceCpu = os::env("SFP_CPU") == "1";
     auto& cu = cuda();
+    const void* srcHost = source ? source->host : nullptr;
+    const int srcRow = source ? source->rowBytes : 0;
     if (!t.device && (forceCpu || !cu.ok)) {
         dp.rowBytes = t.rowBytes;
-        return develop_cpu(f, s.decodeQuality, pp, dz, dp, t.host, e, timing);
+        return develop_cpu(f, s.decodeQuality, pp, dz, dp, t.host, e, timing, srcHost, srcRow);
     }
     if (!cu.ok) { e = cu.error; return false; }
     // Context: the host's current context for device images, else the primary context.
@@ -224,8 +403,9 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
         // The GPU cannot run the kernels (older than the PTX target): develop on the CPU.
         if (!t.device) {
             dp.rowBytes = t.rowBytes;
-            return develop_cpu(f, s.decodeQuality, pp, dz, dp, t.host, e, timing);
+            return develop_cpu(f, s.decodeQuality, pp, dz, dp, t.host, e, timing, srcHost, srcRow);
         }
+        if (source) { e = "This GPU cannot run the plug-in's kernels: switch Develop RAW on"; return false; }
         const size_t packed = static_cast<size_t>(t.width) * 16;
         std::vector<char> img(packed * t.height);
         dp.rowBytes = static_cast<int>(packed);
@@ -238,7 +418,7 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
     // Buffers are shared by all renders in this context; serialise across streams.
     if (x->lastStream != stream && x->lastStream) cu.cuStreamSynchronize(x->lastStream);
     x->lastStream = stream;
-    const size_t n = static_cast<size_t>(W) * H;
+    const size_t n = source ? static_cast<size_t>(dp.W) * dp.H : static_cast<size_t>(W) * H;
     if (x->cap < n) {
         for (CUdeviceptr* p : {&x->raw, &x->raw2, &x->cfa, &x->vhb, &x->lpfb, &x->pqb, &x->R, &x->G, &x->B, &x->T[0], &x->T[1], &x->T[2], &x->T[3], &x->T[4], &x->T[5]})
             if (*p) { cu.cuMemFree(*p); *p = 0; }
@@ -254,8 +434,34 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
     auto launch = [&](CUfunction fn, unsigned w, unsigned h, void** args, const char* name) {
         return check(cu.cuLaunchKernel(fn, (w + bx - 1) / bx, (h + by - 1) / by, 1, bx, by, 1, 0, stream, args, nullptr), name, e);
     };
-    bool reuse = x->valid && x->frameId == f.id && x->quality == s.decodeQuality && x->lastDezig == dz && !std::memcmp(&x->last, &pp, sizeof pp);
-    if (!reuse) {
+    bool reuse = !source && x->valid && x->frameId == f.id && x->quality == s.decodeQuality && x->lastDezig == dz && !std::memcmp(&x->last, &pp, sizeof pp);
+    if (source) {
+        x->valid = false;
+        CUdeviceptr in = source->device;
+        int rowBytes = source->rowBytes;
+        if (!in) {
+            // A host image: its rows packed, then to the GPU.
+            const size_t packed = static_cast<size_t>(dp.W) * 16, bytes = packed * dp.H;
+            if (x->srcCap < bytes) {
+                if (x->src) cu.cuMemFree(x->src);
+                x->src = 0;
+                x->srcCap = 0;
+                if (!check(cu.cuMemAlloc(&x->src, bytes), "GPU memory", e)) return false;
+                x->srcCap = bytes;
+            }
+            x->staging.resize(bytes);
+            for (int y = 0; y < dp.H; ++y)
+                std::memcpy(x->staging.data() + y * packed, static_cast<const char*>(source->host) + static_cast<long long>(y) * source->rowBytes, packed);
+            // The staging memory is used again for the download: have the upload finished first.
+            if (!check(cu.cuMemcpyHtoDAsync(x->src, x->staging.data(), bytes, stream), "Upload source image", e) ||
+                !check(cu.cuStreamSynchronize(stream), "Upload source image", e)) return false;
+            in = x->src;
+            rowBytes = static_cast<int>(packed);
+        }
+        void* a[] = {&in, &x->R, &x->G, &x->B, &dp.W, &dp.H, &rowBytes};
+        if (!launch(x->unpack, dp.W, dp.H, a, "k_unpack")) return false;
+        x->planes[0] = x->R; x->planes[1] = x->G; x->planes[2] = x->B;
+    } else if (!reuse) {
         x->valid = false;
         // Stage through page-locked memory: the previous upload from it has completed
         // once the stream has drained, so wait for the stream first.

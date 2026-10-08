@@ -48,6 +48,45 @@ Highlights, Shadows, Color Boost, Saturation, Midtones, Lift, Gain, Contrast.
 - These are our own implementations with Resolve's names, layout and ranges. The slider response is not Blackmagic's proprietary math.
 - The DNG BaselineExposure (+3 EV on the fp) is applied, as Adobe does.
 
+**Fit and Transform (1.5.0)** — a Fit choice and a Transform group with the controls of Resolve's Transform panel.
+- **Fit:** *Scale to Fit* (default; the hidden Image Fit of earlier projects, e.g. Fill, still applies under it), *Fit Width*
+  (the picture's width = the frame width), *Fit Height*. Zoom 1 = this fit.
+- **Transform, in this order:** flip (about the picture centre), then about the anchor point: zoom X / Y, rotation
+  (degrees, positive anticlockwise), pitch and yaw (the picture as a card turned about its horizontal / vertical axis, seen
+  in perspective from one frame width away; positive pitch leans the top away, positive yaw turns the right side away), then
+  the position. Position and anchor are timeline pixels from the frame centre, x right, y up; at a reduced render scale they
+  scale with it. The anchor alone moves nothing.
+- **One resampling:** output pixel -> Transform (inverse, one 3x3 matrix) -> Fit -> stabilisation and rolling-shutter
+  correction -> the developed full-resolution planes, sampled once with the plug-in's bilinear kernel. With every control
+  neutral the old path is used unchanged, bit for bit (checked against 1.4.2 on 18 frame / timeline combinations).
+- **Kernel (1.5.1):** Lanczos-3, separable in the source axes (6 x 6 taps at 1:1). Where the whole map (fit, Transform,
+  stabiliser zoom) makes the picture smaller, the kernel is widened by the source pixels per output pixel measured at the
+  frame centre, so a downscale is low-pass filtered instead of aliasing. At 1:1 and when enlarging, the result is held to
+  the range of the 2x2 nearest source pixels (anti-ringing). Taps beyond the picture repeat its edge. A position on a source
+  pixel centre at 1:1 returns that pixel exactly, and a 1:1 fit with a neutral Transform is not resampled at all, so those
+  pictures are unchanged; every other framing differs from 1.5.0, which was bilinear. Sharpness still takes its blur from
+  bilinear samples.
+  - Speed, RTX 4080 Laptop GPU, full-resolution demosaic, stabilisation and a rotation, into a 3840x2160 GPU image, whole
+    frame (fetch, upload, demosaic, develop), median / 95th percentile: 4320x2160 source 7.6 / 9.2 ms (bilinear 6.7 / 8.4);
+    3840x2560 source 8.4 / 9.7 ms (bilinear 7.2 / 8.8). Catmull-Rom and Lanczos-2 were 7.1 to 7.5 ms. 50 fps allows 20 ms.
+    Measured on uncompressed synthetic frames; the LJ92 decode of camera files runs on other threads.
+  - Processor path (no NVIDIA GPU): the same kernel; the develop pass takes about 130 ms instead of 45 ms for a UHD frame
+    (whole frame about 260 ms instead of 180 ms on this machine), so it is not real time either way.
+  - Test charts, Best against bilinear: a zone plate through a x0.4 fit: aliasing 14.7 % of full contrast instead of
+    59.5 %, with the contrast inside the output's range kept (101 % / 98 %); a hard edge enlarged 4 times: 10-90 % rise
+    3.6 output pixels instead of 6.0, overshoot 3.7 % (the demosaiced edge itself has 2.5 %).
+  - A hidden parameter, Resampling (Best / Fast), keeps the bilinear kernel for comparison; it is not in the panel.
+- **With the stabiliser:** its Auto Zoom (and its own Zoom) belong to the stabilised picture, before the Transform; the
+  Transform zoom multiplies on top. Auto Zoom keeps the borders hidden for the Transform at its defaults; zooming in keeps
+  them hidden, zooming out, rotating or moving can show them, as in Resolve.
+- **Matching Resolve:** labels, order and defaults follow Resolve's Transform panel. Zoom, position (pixels, y up), rotation
+  (anticlockwise) and anchor follow Resolve's Inspector as documented; Resolve's exact units for Pitch and Yaw are not
+  documented and could not be checked here (no Resolve on the test machine): the plug-in uses degrees.
+- **Resolve settings:** leave the Inspector Transform and the Color page Sizing neutral (input sizing happens before this
+  node, where the plug-in replaces the picture; sizing after it resamples again). Render at the timeline resolution: a
+  different output resolution, or Output Sizing, makes Resolve resample once more. Image Scaling in the Project Settings does
+  not matter for this node's picture, which is always made at the timeline resolution.
+
 **Stabilisation (gyro)** — works only when the clip has gyro data:
 - **Gyro** (read-only): the data in use with frames, sample rate, readout time, focal length and zoom, or why stabilisation is off.
   - In-frame data: "Loading gyro 40 % (N frames)" while the frames are read, then "On | gyro: N frames, in-frame, 2499.48 Hz, …".
@@ -146,11 +185,21 @@ Anchor 0. The plugin gets the clip and the source frame from Resolve on the Colo
   Two modes and two shutter speeds only: the model fits both within about 1 ms, which is the scatter of the measurement. A
   clip at a slow shutter in a fast mode (say MQ 50 at 1/60 s: 6.2 + 8.3 = 14.5 ms) is the test that would confirm it; if
   the model is right its best Sync Offset is 0 as well.
-- **Image scale:** focal length from the gyro data or the DNG, pixel pitch from the gyro data. The camera writes no pitch;
-  the plugin then takes the sensor width the raster stands for: 35.9 mm (the whole sensor) in general, 32.5 mm for HQ
-  (3264 raster). Both are measured: on A001_001 (MQ, 28 mm) the picture moves by 1.009 / 1.006 (x / y) of what the gyro
-  predicts with 35.9 mm; on A001_092 (HQ, 28 mm) it took 32.5 mm (49.1 px per degree), so HQ reads a narrower part of the
-  sensor. That is what the earlier "10.5 % unexplained" was. Other modes (UHD, XQ, LQ, S16, DC crop) are not measured yet.
+- **Image scale (1.4.1).** Focal length from the gyro data or the DNG. The recorded frame shows a window of the
+  6000 x 4000 sensor (6 um pitch, 36 mm wide) across its recorded width, so a raster pixel is 0.006 mm x window width /
+  recorded width. The window comes from the gyro block: R124 writes it with the recorded size (block bytes 3056..3063);
+  R123 marks MQ 50 with crop code 2 and R122 MQ 50 is recognised by its readout (18926 us) with the MQ frame size, both the
+  4608 x 3072 window; an older DC Crop block (crop code 1) is the 1.49 crop (4024 wide); everything else, and every .FPG
+  sidecar, is the whole sensor width (HQ, XQ, UHD, LQ and MQ all are, by the framing test of 2026-10-02). The Gyro line
+  shows the window when it is not the whole width, e.g. "28.0 mm = 3038 px (sensor window 4608x3072, MQ 50)".
+  - Before 1.4.1 HQ was taken as 32.5 mm wide, from A001_092, where the picture moved 10.5 % more than the whole-width
+    model predicts. A001_007 (R122 MQ 50 window) shows the same kind of excess, larger: 1.40 (x) and 1.29 (y) times what
+    the 4608 window predicts (r 0.99 / 0.98). Both were shot hand-held at close focus (0.84 m and 0.98 m); an MQ clip
+    focused at 5.8 m matched the whole-width model within 1 %. Two effects make a close scene move more than a pure
+    rotation predicts: focus breathing (+3 to 4 % at that distance for this lens) and, mainly, the camera turning about a
+    point behind the lens (wrist or body), which also moves it sideways: the extra picture motion is about pivot
+    distance / subject distance. So the excess is taken as a property of those shots, not of the modes, and the scale
+    follows the sensor geometry. For a close-up the Focal Length field can be raised to match.
 - **Measured on A001_092** (HQ 3264×2170, 25 fps, 28 mm, a take with ±20° pans and tilts; frames 1–290, raster px):
 
   | | unstabilised | stabilised, zoom 1 | stabilised, all defaults |

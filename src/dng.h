@@ -7,6 +7,32 @@
 
 namespace sfp {
 
+// Lens shading map: the GainMap of the DNG's OpcodeList3, as the camera writes it from the
+// lens's own data. Always the colour shading; also the vignette when the camera's Vignetting
+// compensation is on (the green plane is then above 1 towards the corners).
+struct GainMap {
+    int rows = 0, cols = 0, planes = 0;   // grid points; 1 plane, or 3: R, G, B
+    int areaW = 0, areaH = 0;             // the area the camera names (used for its shape only)
+    std::vector<float> gain;              // rows x cols x planes, row by row
+    bool valid() const { return rows >= 2 && cols >= 2 && (planes == 1 || planes == 3); }
+    // Largest gain of the brightness (green) plane: above 1 = the map holds a vignette.
+    float brightness() const {
+        float m = 1;
+        for (size_t i = planes == 3 ? 1 : 0; i < gain.size(); i += static_cast<size_t>(planes)) m = gain[i] > m ? gain[i] : m;
+        return m;
+    }
+};
+
+// Lens distortion profile: where a point of the corrected picture was recorded, as a radial
+// factor sum of c[i] r^i. From the WarpRectilinear opcode of OpcodeList3 (terms of the green
+// plane), or from a profile file (lens_profile.h).
+struct LensWarp {
+    bool valid = false;
+    double c[7] = {1, 0, 0, 0, 0, 0, 0};
+    double cx = 0.5, cy = 0.5;   // optical centre as a fraction of the picture
+    double radius = 0;           // r = 1 at this many sensor pixels from the centre; 0 = the whole sensor's half diagonal
+};
+
 struct DngInfo {
     int width = 0, height = 0, bps = 0, compression = 0;
     int tileW = 0, tileH = 0;                 // 0 for strips
@@ -25,6 +51,10 @@ struct DngInfo {
     int iso = 0;
     double fps = 0;
     std::string model;
+    double focalMm = 0, fNumber = 0, focusM = 0;   // EXIF, 0 = unknown
+    std::string lensModel;
+    GainMap shading;                          // rows == 0: the file has none
+    LensWarp warp;
 };
 
 // Parse metadata from a file already read into memory.
@@ -34,6 +64,10 @@ bool parse_dng(const uint8_t* data, size_t size, DngInfo& info, std::string& err
 // threads for LJ92 tiles. Returns false with an error message on malformed data.
 bool decode_raw(const uint8_t* data, size_t size, const DngInfo& info, uint16_t* out,
                 int threads, std::string& error);
+
+// Applies a shading map to info's decoded raw samples in place (black level kept, clipped samples left
+// clipped). The frame shows the middle fracW x fracH of what the map covers (1 = all of it).
+void apply_shading(const DngInfo& info, const GainMap& g, uint16_t* raw, double fracW, double fracH);
 
 bool read_file(const std::string& path, std::vector<uint8_t>& data, std::string& error);
 

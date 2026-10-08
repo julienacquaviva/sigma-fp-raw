@@ -22,6 +22,9 @@ os.environ['SFP_GYRO_CACHE_DIR'] = 'off'                    # no cache files fro
 sys.path.insert(0, str(HERE))
 from ofx_host import OFXHost, OK  # noqa: E402
 
+# The values these tests were written for (the defaults until 1.5.1; since 1.6.0: off, 0.1 s, Dynamic).
+STAB_TEST = dict(stabEnable=1, stabSmoothness=0.5, stabZoomMode=0, developRaw=1)   # and the plug-in's own development (off by default since 1.9.2)
+
 PLUGIN = ROOT / 'dist/SigmaFpRaw.ofx.bundle/Contents/Win64/SigmaFpRaw.ofx'
 CLI = ROOT / 'build/sfp_cli.exe'
 SAMPLE = HERE / 'data/A001_092.FPG'
@@ -35,7 +38,7 @@ MARK_DELAY = 0.017
 PITCH_NM = 10000            # synthetic files: 28 mm -> 2800 px
 F_PX = 2800.0
 CX, CY = RASTER[0] / 2, RASTER[1] / 2
-FALLBACK_WIDTH_MM = 32.5    # kSensorWidthMm in gyro.cpp (calibrated on A001_092)
+SENSOR_PITCH_MM = 0.006     # the fp's sensor: 6000 pixels over 36 mm; a frame without a window covers its whole width
 
 
 # ---- synthetic files and the reference model ----
@@ -219,7 +222,7 @@ def main():
     err = float(np.abs(path[:, 1:5] - qi).max())
     assert err < 1e-9, err
     assert 'On | A001_092.FPG: 292 frames, 2499.46 Hz' in j['status'] and 'gyro data ends at frame 292 (before the end of the clip)' in j['status']
-    fallback = 28.0 / (FALLBACK_WIDTH_MM / 3264)
+    fallback = 28.0 / (SENSOR_PITCH_MM * 6000 / 3240)          # the active width of this raster
     assert abs(j['focal_px'] - fallback) < 1e-3
     total = np.degrees(2 * np.arccos(np.clip(np.abs((q[:1] * q[table - 1]).sum(1)), 0, 1)))
     ok('sample A001_092.FPG: header, frame times and integrated orientation equal the reference',
@@ -282,7 +285,7 @@ def main():
     assert abs(r['focal_px'] - fallback) < 1e-3
     r = gyro(tmp / 'pan.FPG', 'frame=100', 'stab=0')
     assert r['on'] == 0 and r['status'].startswith('Off (switched off)')
-    ok('focal length: file pitch, calibrated fallback pitch, manual lens needs the override, switch',
+    ok('focal length: file pitch, whole sensor width when no pitch, manual lens needs the override, switch',
        fallback_px_at_28mm=float(fallback))
 
     # -- 1f. rolling shutter: constant pan, virtual camera = camera at the readout middle --
@@ -374,10 +377,11 @@ def main():
     assert b['delay_from_exposure'] == 0 and b['delay_ms'] == 17.0 and '| sync 17.0 ms from the gyro data (exposure time unknown) -2.0 ms offset |' in b['status'], b['status']
     c = gyro(write_fpg(tmp / 'noro.FPG', g0, 50, exposure_us=10000, readout_us=0), 'frame=10')
     assert c['delay_from_exposure'] == 0 and c['delay_ms'] == 17.0 and '(readout time unknown)' in c['status']
-    # Image scale by mode: HQ (3264 raster) 32.5 mm, the others the full 35.9 mm sensor width.
+    # Image scale: every mode before R122 covers the whole 36 mm sensor width (framing test of 2026-10-02).
     mq = gyro(write_fpg(tmp / 'mq.FPG', g0, 50, raster=(3024, 2010), active=(8, 5, 3008, 2000), pitch_nm=0))
     hq = gyro(write_fpg(tmp / 'hq.FPG', g0, 50, pitch_nm=0))
-    assert abs(mq['focal_px'] - 28 / 35.9 * 3024) < 1e-3 and abs(hq['focal_px'] - 28 / 32.5 * 3264) < 1e-3
+    assert abs(mq['focal_px'] - 28 / (0.006 * 6000 / 3008)) < 1e-3 and abs(hq['focal_px'] - 28 / (0.006 * 6000 / 3240)) < 1e-3
+    assert mq['window'] == [6000, 4000] and mq['recorded'] == [3008, 2000] and 'sensor window' not in mq['status']
     ok('sync = readout/2 + exposure/2 when the exposure time is known, else the value in the gyro data; image scale per mode',
        delay_ms_at_1_640s=a['delay_ms'], delay_ms_exposure_unknown=b['delay_ms'], focal_px_mq=mq['focal_px'], focal_px_hq=hq['focal_px'])
 
@@ -633,6 +637,7 @@ def rolling_shutter_check(clip, ok, skip):
     for name, values in (('unstabilised', dict(stabEnable=0)), ('amount_0', dict(stabRollingShutter=0.0)),
                          ('amount_1', dict(stabRollingShutter=1.0)), ('amount_minus_1', dict(stabRollingShutter=-1.0))):
         host = OFXHost(PLUGIN, canvas=(1620, 1080))
+        host.set(**STAB_TEST)
         source(host, frames[0])
         host.set(decodeQuality=1, stabAutoZoom=0, gyroFile='' if fpgs else str(fpg), **values)
         res[name] = band_shifts(host, N)
@@ -663,6 +668,7 @@ def end_of_data(clip, ok, skip):
 
     def run(**values):
         host = OFXHost(PLUGIN, canvas=(1620, 1080))
+        host.set(**STAB_TEST)
         source(host, frames[0])
         status = host.get('stabStatus')
         host.set(decodeQuality=1, **values)
@@ -711,12 +717,20 @@ def plugin_tests(frames, tmp, ok, d_px, share):
         assert p.get('OfxParamPropParent') == ['stab'], n
     defaults = {n: host.get(n) for n in sorted(names)}
     assert host.choices('stabRange') == ['Whole Clip', 'Automatic', 'Manual'] and host.choices('stabZoomMode') == ['Fixed', 'Dynamic']
-    assert [defaults.pop(k) for k in ('stabRange', 'stabRangeStart', 'stabRangeEnd', 'stabZoomMode', 'stabZoomSmooth')] == [1, 1.0, 0.0, 0, 4.0]
+    assert [defaults.pop(k) for k in ('stabRange', 'stabRangeStart', 'stabRangeEnd', 'stabZoomMode', 'stabZoomSmooth')] == [1, 1.0, 0.0, 1, 4.0]
     assert [defaults.pop(k) for k in ('stabReadout', 'stabFocalAuto', 'stabReadoutAuto')] == [0.0, 1, 1]
-    assert defaults == {'gyroFile': '', 'stabAutoZoom': 1, 'stabEnable': 1, 'stabFocal': 0.0, 'stabMaxZoom': 1.3, 'stabRollingShutter': 1.0,
-                        'stabSmoothness': 0.5, 'stabStatus': 'Off: no DNG source', 'stabSync': 0.0, 'stabZoom': 1.0}, defaults
-    ok('Stabilisation group declared, defaults: on, smoothness 0.5 s, rolling shutter 1, sync 0, focal from file, auto zoom up to 1.3, '
-       'range automatic, zoom mode fixed')
+    assert defaults == {'gyroFile': '', 'stabAutoZoom': 1, 'stabEnable': 0, 'stabFocal': 0.0, 'stabMaxZoom': 1.3, 'stabRollingShutter': 1.0,
+                        'stabSmoothness': 0.1, 'stabStatus': 'Off: no DNG source', 'stabSync': 0.0, 'stabZoom': 1.0}, defaults
+    gp = host.obj(host.obj(host.params()['gyroFile'])['props'])['values']
+    zp = host.obj(host.obj(host.params()['stabZoomSmooth'])['props'])['values']
+    assert gp.get('OfxParamPropSecret') == [1] and zp.get('OfxPropLabel') == ['Smoothness'] and zp.get('OfxParamPropEnabled') == [1]
+    host.set(stabZoomMode=0); host.changed('stabZoomMode')
+    assert zp.get('OfxParamPropEnabled') == [0]
+    host.set(stabZoomMode=1); host.changed('stabZoomMode')
+    assert zp.get('OfxParamPropEnabled') == [1]
+    ok('Stabilisation group declared, defaults (1.6.0): off, smoothness 0.1 s, rolling shutter 1, sync 0, focal from file, auto zoom up to 1.3, '
+       'range automatic, zoom mode dynamic; Gyro File hidden; the zoom Smoothness is greyed out with Zoom Mode Fixed')
+    host.set(**STAB_TEST)
 
     # No .FPG next to the clip: off, and the image is the one the plug-in gave before.
     source(host, frames[0])
@@ -826,9 +840,10 @@ def plugin_tests(frames, tmp, ok, d_px, share):
     shutil.copy(frames[0], clip / frames[0].name)
     shutil.copy(SAMPLE, clip / 'A001_092.FPG')
     auto = OFXHost(PLUGIN, canvas=(1620, 1080))
+    auto.set(**STAB_TEST)
     source(auto, clip / frames[0].name)
     status = auto.get('stabStatus')
-    assert status.startswith('On | A001_092.FPG: 292 frames, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2812 px, zoom '), status
+    assert status.startswith('On | A001_092.FPG: 292 frames, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2520 px, zoom '), status
     st, on = auto.render(source_frame=0)
     auto.set(stabEnable=0)
     auto.changed('stabEnable')
@@ -844,6 +859,7 @@ def prefill_in_host(frames, tmp, ok):
     g, _ = pulse_clip(1, 1)
     other = write_fpg(tmp / 'lens50.FPG', g, 200, focal_um=50000, readout_us=20000)
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
+    host.set(**STAB_TEST)
     assert (host.get('stabFocal'), host.get('stabReadout'), host.get('stabFocalAuto'), host.get('stabReadoutAuto')) == (0.0, 0.0, 1, 1)
     props = {n: host.obj(host.obj(host.params()[n])['props'])['values'] for n in ('stabFocalAuto', 'stabReadoutAuto', 'stabReadout')}
     assert props['stabFocalAuto'].get('OfxParamPropSecret') == [1] and props['stabReadoutAuto'].get('OfxParamPropSecret') == [1]
@@ -884,6 +900,7 @@ def prefill_in_host(frames, tmp, ok):
     host.close()
     # A reopened project: the stored override is kept, a stored clip value is brought up to date.
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
+    host.set(**STAB_TEST)
     host.set(stabFocal=35.0, stabFocalAuto=0, stabReadout=99.0, stabReadoutAuto=1, gyroFile=str(tmp / 'pan.FPG'))
     source(host, frames[0])
     assert (host.get('stabFocal'), host.get('stabFocalAuto'), host.get('stabReadout'), host.get('stabReadoutAuto')) == (35.0, 0, 24.8, 1)
@@ -903,6 +920,7 @@ def mq_clips(ok, skip):
 
     def measure(frames, first, count):
         host = OFXHost(PLUGIN, canvas=(1504, 1000))
+        host.set(**STAB_TEST)
         source(host, frames[0])
         host.set(decodeQuality=1, stabEnable=0)
         prev, out = None, []
@@ -928,13 +946,14 @@ def mq_clips(ok, skip):
 
     # The plug-in on a real in-frame MQ clip, everything at its default.
     host = OFXHost(PLUGIN, canvas=(1504, 1000))
+    host.set(**STAB_TEST)
     source(host, clips['A001_001'][0])
     for _ in range(200):
         host.changed('stabEnable')
         if not host.get('stabStatus').startswith('Loading'):
             break
     status = host.get('stabStatus')
-    assert status.startswith('On | gyro: 1740 frames, in-frame, 2499.49 Hz, readout 12.4 ms, 28.0 mm = 2359 px, zoom ') and \
+    assert status.startswith('On | gyro: 1740 frames, in-frame, 2499.49 Hz, readout 12.4 ms, 28.0 mm = 2333 px, zoom ') and \
         '| sync 7.0 ms = readout/2 + exposure/2 (1/640 s) | range: whole clip' in status, status
     assert (host.get('stabFocal'), host.get('stabReadout')) == (28.0, 12.42)
     host.set(decodeQuality=1)
@@ -1014,6 +1033,7 @@ def range_in_host(frames, tmp, ok):
         return int(np.all(edge == 0, axis=1).sum() > 20)
 
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
+    host.set(**STAB_TEST)
     source(host, frames[0])
     host.set(decodeQuality=1, gyroFile=str(rough))
     host.changed('gyroFile')
@@ -1039,6 +1059,7 @@ def range_in_host(frames, tmp, ok):
     host.close()
     # A piece cut from the middle: effect time 0..99 shows source frames 231..330.
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
+    host.set(**STAB_TEST)
     source(host, frames[0])
     host.set(decodeQuality=1, gyroFile=str(rough))
     host.set_clip_range(0, 99)
@@ -1114,6 +1135,7 @@ def real_clip(frames, ok):
 
     def render(name=None, **values):
         host = OFXHost(PLUGIN, canvas=(1620, 1080))
+        host.set(**STAB_TEST)
         source(host, frames[0])
         host.set(decodeQuality=1, gyroFile=str(SAMPLE), **values)
         seq = np.zeros((N, 540, 810), np.float32)
@@ -1192,6 +1214,7 @@ def real_clip(frames, ok):
     # Rolling shutter: horizontal shift of the top band against the bottom band, per frame pair.
     def shear(**values):
         host = OFXHost(PLUGIN, canvas=(1620, 1080))
+        host.set(**STAB_TEST)
         source(host, frames[0])
         host.set(decodeQuality=1, gyroFile=str(SAMPLE), **values)
         prev, out = None, []

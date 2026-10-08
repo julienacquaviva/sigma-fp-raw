@@ -4,6 +4,7 @@
 #include "lj92.h"
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace sfp {
@@ -186,6 +187,7 @@ bool lj92_decode(const uint8_t* data, size_t size, uint16_t* out, int stride, in
     Bits b{p, end};
     std::vector<uint16_t> prev(W), cur(W);
     const int initial = 1 << (precision - pt - 1);
+    const int maxValue = (1 << (precision - pt)) - 1;   // a valid stream never leaves its precision
     const Huffman* ht[4];
     for (int c = 0; c < nf; ++c) ht[c] = &tables[td[c]];
     int mcus = 0;
@@ -215,8 +217,15 @@ bool lj92_decode(const uint8_t* data, size_t size, uint16_t* out, int stride, in
                     }
                 }
                 int d = decode_diff(b, *ht[c]);
-                if (d == 0x40000) { error = "LJ92: invalid Huffman code"; return false; }
+                if (d == 0x40000) {
+                    error = "LJ92: invalid Huffman code (row " + std::to_string(y) + ", column " + std::to_string(x) + "): damaged data";
+                    return false;
+                }
                 cur[i] = static_cast<uint16_t>(pred + d);
+                if (cur[i] > maxValue) {
+                    error = "LJ92: sample beyond " + std::to_string(precision) + " bits (row " + std::to_string(y) + "): damaged data";
+                    return false;
+                }
             }
             ++mcus;
         }

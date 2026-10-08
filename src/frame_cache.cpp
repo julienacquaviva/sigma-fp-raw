@@ -10,6 +10,9 @@
 #include <thread>
 #include <unordered_map>
 
+#include "gyro.h"
+#include "lens_profile.h"
+
 namespace sfp {
 
 namespace {
@@ -18,8 +21,49 @@ double ms_since(std::chrono::steady_clock::time_point t) {
 }
 std::atomic<uint64_t> gFrameId{1};
 
-std::shared_ptr<Frame> load(const std::string& path, int threads, std::string& error) {
+// Cache key of a frame with its shading map applied.
+const char kShaded[] = "|shaded|";
+std::string cache_key(const std::string& path, bool shading, const std::string& vignetteFile) { return shading ? path + kShaded + vignetteFile : path; }
+
+// The part of the lens profile a clip's frames show. The camera writes one and the same profile
+// (shading map and distortion terms) whatever the recording mode: bit for bit the same over
+// 3:2, 16:9, 2:1 and 2.4:1 recordings and over every sensor window (38 clips, 2026-10-05 to
+// 10-07). It is the profile of the whole 3:2 sensor; the frame's gyro block tells the window
+// that was read, taken as centred. Kept per clip. Frames without a block: the whole profile.
+void shading_window(const std::string& path, const DngInfo& info, double& fracW, double& fracH) {
+    static std::mutex m;
+    static std::unordered_map<std::string, std::pair<double, double>> known;
+    std::string prefix, suffix;
+    long long number = 0;
+    int digits = 0;
+    const std::string key = split_sequence(path, prefix, number, digits, suffix) ? prefix : path;
+    {
+        std::lock_guard<std::mutex> l(m);
+        auto it = known.find(key);
+        if (it != known.end()) { fracW = it->second.first; fracH = it->second.second; return; }
+    }
+    fracW = fracH = 1;
+    GyroBlock b;
+    if (read_fpg2(path, b)) {
+        GyroHeader h;
+        h.activeW = info.cropW; h.activeH = info.cropH;
+        window_for(b.dcCrop, b.windowW, b.windowH, b.recordedW, b.recordedH, b.readoutUs, h);
+        if (h.windowW > 0 && h.windowH > 0) {
+            fracW = std::min(1.0, h.windowW / 6048.0);
+            fracH = std::min(1.0, h.windowH / 4032.0);
+        }
+    }
+    std::lock_guard<std::mutex> l(m);
+    if (known.size() > 64) known.clear();
+    known[key] = {fracW, fracH};
+}
+
+std::shared_ptr<Frame> load(const std::string& key, int threads, std::string& error) {
     auto f = std::make_shared<Frame>();
+    const size_t mark = key.find(kShaded);
+    const bool shading = mark != std::string::npos;
+    const std::string path = shading ? key.substr(0, mark) : key;
+    const std::string vignetteFile = shading ? key.substr(mark + sizeof kShaded - 1) : std::string();
     f->path = path;
     auto t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> data;
@@ -29,6 +73,30 @@ std::shared_ptr<Frame> load(const std::string& path, int threads, std::string& e
     if (!parse_dng(data.data(), data.size(), f->info, error)) return nullptr;
     f->raw.resize(static_cast<size_t>(f->info.width) * f->info.height);
     if (!decode_raw(data.data(), data.size(), f->info, f->raw.data(), threads, error)) return nullptr;
+    shading_window(path, f->info, f->profileW, f->profileH);
+    if (shading) {
+        // The vignette: the picked file, else the frame's own, else the installed Adobe profile
+        // (lens_vignette). With a vignette from elsewhere the frame's map still gives the colour.
+        GainMap own = f->info.shading, map;
+        std::string note;
+        bool ownColour = true;
+        if (lens_vignette(vignetteFile, f->info, map, ownColour, note)) {
+            apply_shading(f->info, map, f->raw.data(), f->profileW, f->profileH);
+            f->shaded = true;
+            if (ownColour && own.valid() && own.planes == 3) {
+                for (size_t i = 0; i < own.gain.size(); i += 3) {
+                    const float g = own.gain[i + 1];
+                    own.gain[i] /= g; own.gain[i + 1] = 1; own.gain[i + 2] /= g;
+                }
+            } else {
+                own = GainMap{};
+            }
+        }
+        if (own.valid()) {
+            apply_shading(f->info, own, f->raw.data(), f->profileW, f->profileH);
+            f->shaded = true;
+        }
+    }
     f->decodeMs = ms_since(t1);
     f->id = gFrameId++;
     return f;
@@ -141,7 +209,8 @@ void FrameCache::set_budget(size_t b) {
     d->evict(d->budget);
 }
 
-std::shared_ptr<const Frame> FrameCache::fetch(const std::string& path, std::string& error) {
+std::shared_ptr<const Frame> FrameCache::fetch(const std::string& file, std::string& error, bool shading, const std::string& vignetteFile) {
+    const std::string path = cache_key(file, shading, vignetteFile);
     std::unique_lock<std::mutex> l(d->m);
     auto it = d->map.find(path);
     if (it != d->map.end()) {
@@ -183,10 +252,11 @@ std::shared_ptr<const Frame> FrameCache::fetch(const std::string& path, std::str
     return result;
 }
 
-void FrameCache::prefetch(const std::vector<std::string>& paths) {
+void FrameCache::prefetch(const std::vector<std::string>& paths, bool shading, const std::string& vignetteFile) {
     {
         std::lock_guard<std::mutex> l(d->m);
-        d->queue.assign(paths.begin(), paths.end());
+        d->queue.clear();
+        for (const auto& p : paths) d->queue.push_back(cache_key(p, shading, vignetteFile));
     }
     d->work.notify_all();
 }

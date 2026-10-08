@@ -17,10 +17,10 @@ import argparse, hashlib, json, os, shutil, stat, struct, subprocess, sys, zipfi
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '1.4.0'
+VERSION = '1.9.3'
 PLUGIN_ID = 'com.sigmafpmods.raw'
 CORE = ['dng.cpp', 'lj92.cpp', 'color.cpp', 'cuda_api.cpp', 'frame_cache.cpp', 'develop.cpp', 'kernels_cpu.cpp',
-        'gyro.cpp', 'gyro_inframe.cpp', 'platform.cpp']
+        'gyro.cpp', 'gyro_inframe.cpp', 'platform.cpp', 'lens_profile.cpp']
 INCLUDES = ['src', 'src/generated', 'third_party/openfx/include']
 COMMON = ['-std=c++17', '-O3', '-DNDEBUG', '-Wall', '-Wextra']
 
@@ -54,7 +54,7 @@ def find_zig():
 
 
 def flags():
-    return COMMON + ['-I' + str(ROOT / d) for d in INCLUDES]
+    return COMMON + [f'-DSFP_VERSION="{VERSION}"'] + ['-I' + str(ROOT / d) for d in INCLUDES]
 
 
 def zig_build(zig, target, cpu, sources, out, shared):

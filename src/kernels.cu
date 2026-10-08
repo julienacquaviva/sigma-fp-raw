@@ -374,6 +374,56 @@ SFP_DEV float encode(float v, int gamma) {
 }
 SFP_DEV float decode_g24(float v) { return v > 0.f ? powf(v, 2.4f) : v; }
 
+// The encodings Resolve's Camera RAW can hand over (the plug-in's "Resolve Gamma" list), both ways.
+// 0 linear, 1 gamma 2.2, 2 gamma 2.4, 3 gamma 2.6, 4 Rec.709, 5 sRGB, 6 Blackmagic Design Film,
+// 7 Blackmagic Design 4K Film, 8 Blackmagic Design 4.6K Film, 9 DaVinci Intermediate, 10 ACEScct.
+// The Blackmagic curves are  code = A ln(linear + B) + C  above a cut and a straight line of the
+// same slope below it; the constants reproduce Resolve's own tables to their last digit.
+SFP_DEV void bmd_curve(int id, float* A, float* B, float* C, float* cut) {
+    if (id == 7) { *A = 0.29529631f; *B = 0.07974455f; *C = 0.78163686f; *cut = 0.052812f; }
+    else if (id == 8) { *A = 0.15753964f; *B = 0.02359390f; *C = 0.66140084f; *cut = 0.096414f; }
+    else { *A = 0.18644097f; *B = 0.03251850f; *C = 0.67230670f; *cut = 0.060236f; }
+}
+SFP_DEV float pt_decode(float e, int id) {
+    switch (id) {
+        case 1: return e > 0.f ? powf(e, 2.2f) : e;
+        case 2: return e > 0.f ? powf(e, 2.4f) : e;
+        case 3: return e > 0.f ? powf(e, 2.6f) : e;
+        case 4: return e < 0.081f ? e / 4.5f : powf((e + 0.099f) / 1.099f, 1.f / 0.45f);
+        case 5: return e <= 0.04045f ? e / 12.92f : powf((e + 0.055f) / 1.055f, 2.4f);
+        case 6: case 7: case 8: {
+            float A, B, C, cut;
+            bmd_curve(id, &A, &B, &C, &cut);
+            const float lc = expf((cut - C) / A) - B;
+            return e >= cut ? expf((e - C) / A) - B : lc + (e - cut) * (lc + B) / A;
+        }
+        case 9: {
+            const float A = 0.0075f, B = 7.0f, C = 0.07329248f, M = 10.44426855f, CUT = 0.00262409f;
+            return e <= CUT * M ? e / M : exp2f(e / C - B) - A;
+        }
+        case 10: return e <= 0.155251141552511f ? (e - 0.0729055341958355f) / 10.5402377416545f : exp2f(e * 17.52f - 9.72f);
+        default: return e;
+    }
+}
+SFP_DEV float pt_encode(float v, int id) {
+    switch (id) {
+        case 1: return v > 0.f ? powf(v, 1.f / 2.2f) : v;
+        case 2: return v > 0.f ? powf(v, 1.f / 2.4f) : v;
+        case 3: return v > 0.f ? powf(v, 1.f / 2.6f) : v;
+        case 4: return encode(v, 3);
+        case 5: return encode(v, 4);
+        case 6: case 7: case 8: {
+            float A, B, C, cut;
+            bmd_curve(id, &A, &B, &C, &cut);
+            const float lc = expf((cut - C) / A) - B;
+            return v >= lc ? A * logf(v + B) + C : cut + (v - lc) * A / (lc + B);
+        }
+        case 9: return encode(v, 5);
+        case 10: return encode(v, 6);
+        default: return v;
+    }
+}
+
 
 SFP_DEV void sample3(const float* R, const float* G, const float* B, int W, int H, float sx, float sy, bool nearest, float o[3]) {
     if (nearest) {
@@ -394,6 +444,81 @@ SFP_DEV void sample3(const float* R, const float* G, const float* B, int W, int 
     o[2] = B[a] * w00 + B[b] * w01 + B[c] * w10 + B[d] * w11;
 }
 
+// Resampling kernels, x in source pixels (already divided by the widening factor).
+SFP_INL float resample_w(int type, float x) {
+    x = fabsf(x);
+    if (type == kResampleCatmullRom) {
+        if (x < 1.f) return (1.5f * x - 2.5f) * x * x + 1.f;
+        if (x < 2.f) return ((-0.5f * x + 2.5f) * x - 4.f) * x + 2.f;
+        return 0.f;
+    }
+    const float a = type == kResampleLanczos3 ? 3.f : 2.f;
+    if (x >= a) return 0.f;
+    if (x < 1e-6f) return 1.f;
+    const float px = 3.14159265358979f * x;
+    return a * sinf(px) * sinf(px / a) / (px * px);
+}
+
+// One sample of the developed planes at (sx, sy) with a separable kernel, widened by kx / ky
+// when the map shrinks the picture (so that a downscale does not alias). Taps beyond the
+// picture (the crop x0c..x1c, y0c..y1c) repeat its edge pixels. Upscaling and 1:1: the result is held to the range of the 2x2
+// nearest source pixels, which removes the kernel's ringing at sharp edges (anti-ringing).
+// A position on a source pixel centre at 1:1 returns that pixel exactly.
+#define SFP_MAX_TAPS 64
+SFP_DEV void sample_k(const float* R, const float* G, const float* B, int W, int x0c, int y0c, int x1c, int y1c, float sx, float sy, int type,
+                      float kx, float ky, float o[3]) {
+    const float fx = sx - 0.5f, fy = sy - 0.5f;
+    const float sup = type == kResampleLanczos3 ? 3.f : 2.f;
+    const bool exactX = kx <= 1.f && fx == floorf(fx), exactY = ky <= 1.f && fy == floorf(fy);
+    const float rx = exactX ? 0.f : sup * kx, ry = exactY ? 0.f : sup * ky;
+    int x0 = (int)ceilf(fx - rx), x1 = (int)floorf(fx + rx), y0 = (int)ceilf(fy - ry), y1 = (int)floorf(fy + ry);
+    if (x1 - x0 + 1 > SFP_MAX_TAPS) { int c = (int)floorf(fx); x0 = c - SFP_MAX_TAPS / 2 + 1; x1 = c + SFP_MAX_TAPS / 2; }
+    if (y1 - y0 + 1 > SFP_MAX_TAPS) { int c = (int)floorf(fy); y0 = c - SFP_MAX_TAPS / 2 + 1; y1 = c + SFP_MAX_TAPS / 2; }
+    float wx[SFP_MAX_TAPS];
+    float wxs = 0.f;
+    for (int x = x0; x <= x1; ++x) {
+        const float w = exactX ? 1.f : resample_w(type, ((float)x - fx) / kx);
+        wx[x - x0] = w;
+        wxs += w;
+    }
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, ws = 0.f;
+    for (int y = y0; y <= y1; ++y) {
+        const float wy = exactY ? 1.f : resample_w(type, ((float)y - fy) / ky);
+        if (wy == 0.f) continue;
+        const size_t row = (size_t)clampi(y, y0c, y1c) * W;
+        float r0 = 0.f, r1 = 0.f, r2 = 0.f;
+        for (int x = x0; x <= x1; ++x) {
+            const float w = wx[x - x0];
+            const size_t i = row + clampi(x, x0c, x1c);
+            r0 += w * R[i]; r1 += w * G[i]; r2 += w * B[i];
+        }
+        acc0 += wy * r0; acc1 += wy * r1; acc2 += wy * r2;
+        ws += wy * wxs;
+    }
+    o[0] = acc0 / ws; o[1] = acc1 / ws; o[2] = acc2 / ws;
+    if (kx <= 1.f && ky <= 1.f && !(exactX && exactY)) {
+        // Anti-ringing: within the range of the 2x2 neighbours.
+        int ax = clampi((int)floorf(fx), x0c, x1c), bx = clampi((int)floorf(fx) + 1, x0c, x1c);
+        int ay = clampi((int)floorf(fy), y0c, y1c), by = clampi((int)floorf(fy) + 1, y0c, y1c);
+        const size_t i00 = (size_t)ay * W + ax, i01 = (size_t)ay * W + bx, i10 = (size_t)by * W + ax, i11 = (size_t)by * W + bx;
+        const float* P[3] = {R, G, B};
+        for (int c = 0; c < 3; ++c) {
+            const float lo = fminf(fminf(P[c][i00], P[c][i01]), fminf(P[c][i10], P[c][i11]));
+            const float hi = fmaxf(fmaxf(P[c][i00], P[c][i01]), fmaxf(P[c][i10], P[c][i11]));
+            o[c] = clampf(o[c], lo, hi);
+        }
+    }
+}
+
+// The host's picture (RGBA float rows, bottom row first, rowBytes apart) into three planes, top row first.
+SFP_KERNEL k_unpack(SFP_XY_ARGS const float* src, float* R, float* G, float* B, int W, int H, int rowBytes) {
+    SFP_XY(x, y);
+    if (x >= W || y >= H) return;
+    const float* s = (const float*)((const char*)src + (long long)(H - 1 - y) * rowBytes) + 4 * x;
+    size_t i = (size_t)y * W + x;
+    R[i] = s[0]; G[i] = s[1]; B[i] = s[2];
+}
+
 SFP_KERNEL k_develop(SFP_XY_ARGS const float* R, const float* G, const float* B, float* out, SFP_BYVAL(DevelopParams) p) {
     SFP_XY(ox, oy);
     if (ox >= p.outW || oy >= p.outH) return;
@@ -401,6 +526,10 @@ SFP_KERNEL k_develop(SFP_XY_ARGS const float* R, const float* G, const float* B,
     // Output pixel (ox, oy) is RoD pixel (boundsX + ox, boundsY + oy); OFX y is
     // bottom-up, so it shows image row (rodH - 1 - y) of the fitted frame.
     float ix = (float)(p.boundsX + ox) + 0.5f, iy = (float)(p.rodH - 1 - (p.boundsY + oy)) + 0.5f;
+    if (p.xform && !xform_map(p, ix, iy, &ix, &iy)) {
+        o[0] = o[1] = o[2] = 0.f; o[3] = 1.f;
+        return;
+    }
     float sx = (ix - p.offX) / p.scaleX, sy = (iy - p.offY) / p.scaleY;
     if (sx < 0.f || sy < 0.f || sx >= (float)p.cropW || sy >= (float)p.cropH) {
         o[0] = o[1] = o[2] = 0.f; o[3] = 1.f;
@@ -415,8 +544,29 @@ SFP_KERNEL k_develop(SFP_XY_ARGS const float* R, const float* G, const float* B,
             return;
         }
     }
+    if (p.lens.on) {
+        // Lens distortion: where the lens put this point of the rectilinear picture.
+        lens_map(p.lens, sx, sy, &sx, &sy);
+        if (sx < (float)p.cropX || sy < (float)p.cropY || sx >= (float)(p.cropX + p.cropW) || sy >= (float)(p.cropY + p.cropH)) {
+            o[0] = o[1] = o[2] = 0.f; o[3] = 1.f;
+            return;
+        }
+    }
     float c[3];
-    sample3(R, G, B, p.W, p.H, sx, sy, p.nearest, c);
+    if (p.resampler == kResampleBilinear || p.nearest) sample3(R, G, B, p.W, p.H, sx, sy, p.nearest, c);
+    else sample_k(R, G, B, p.W, p.cropX, p.cropY, p.cropX + p.cropW - 1, p.cropY + p.cropH - 1, sx, sy, p.resampler, p.kx, p.ky, c);
+    if (p.passthrough) {
+        // The host's own picture: only the framing, the stabilisation and the lens distortion,
+        // and the vignette where this point was recorded (in linear light).
+        if (p.vig.on) {
+            const float dx = (sx - p.vig.cx) * p.vig.invR, dy = (sy - p.vig.cy) * p.vig.invR;
+            const float r2 = dx * dx + dy * dy;
+            const float g = clampf(1.f + r2 * (p.vig.a[0] + r2 * (p.vig.a[1] + r2 * (p.vig.a[2] + r2 * p.vig.a[3]))), 0.5f, 8.f);
+            for (int i = 0; i < 3; ++i) c[i] = pt_encode(pt_decode(c[i], p.vig.gamma) * g, p.vig.gamma);
+        }
+        o[0] = c[0]; o[1] = c[1]; o[2] = c[2]; o[3] = 1.f;
+        return;
+    }
     if (p.sharpen > 0.f) {
         // Unsharp mask on the demosaiced signal (3x3 binomial blur at source pitch).
         float acc[3] = {0, 0, 0};

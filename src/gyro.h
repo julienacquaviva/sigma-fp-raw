@@ -36,6 +36,10 @@ struct GyroHeader {
     uint32_t preroll = 0;
     double pitchNm = 0;           // pixel pitch at raster scale, 0 = unknown
     uint32_t resolution = 0, dcCrop = 0, bitDepth = 0, sensorMode = 0;
+    // Image scale: the recorded frame (recordedW x recordedH, the DNG's active image) shows
+    // windowW x windowH pixels of the 6000 x 4000 sensor (6 um pitch). See window_for().
+    int windowW = 0, windowH = 0, recordedW = 0, recordedH = 0;
+    int windowSource = 0;         // 0 whole sensor, 1 written with the frame (R124), 2 MQ 50 crop code (R123), 3 MQ 50 readout (R122), 4 DC Crop
 };
 
 // One frame's in-frame gyro block ("FPG2", FPGYRO_INFRAME.md).
@@ -51,11 +55,15 @@ struct GyroBlock {
     int32_t markDelayUs = 0;
     unsigned sensorMode = 0, resolution = 0, dcCrop = 0, bitDepth = 0, lsb = 0;
     int axis[3] = {0, 0, 0};
+    // R124 trailer (region bytes 3056..3063): sensor window and recorded size; 0 = not written.
+    unsigned windowW = 0, windowH = 0, recordedW = 0, recordedH = 0;
     std::vector<int16_t> samples; // n x (X, Y, Z)
 };
 const int kFpg2Region = 0xC00;    // the block sits in the last 3072 bytes of the MakerNote
 const int kFpg2MaxSamples = 500;
 
+// Fills h.window*/recorded* from a block's crop code, R124 trailer and readout (or a sidecar's DC flag).
+void window_for(unsigned crop, unsigned ww, unsigned wh, unsigned rw, unsigned rh, double readoutUs, GyroHeader& h);
 // Parses the block region of one frame. False (with a reason) when there is no valid block.
 bool parse_fpg2(const uint8_t* region, size_t size, GyroBlock& out, std::string* why = nullptr);
 // Reads the block of one DNG file: fixed offset first, then through IFD0 -> EXIF -> MakerNote.
@@ -223,11 +231,17 @@ GyroLoad inframe_gyro_wait(const std::string& dngPath);   // blocks until the sc
 // caching anything (timing tool). Returns the milliseconds taken.
 double scan_blocks(const std::string& dngPath, long long& files, long long& found, int threads = 0, bool fixedOffsetOnly = false,
                    bool unbuffered = false);
-void gyro_shutdown();                                      // stops background scans (before the library unloads)
+void gyro_shutdown();
+// Whether a 3024x2010 frame comes from the 2x2 binned readout (M98): 1, from a 1:1 sensor window
+// of the same size (R122 / R123 MQ 50, R124 3000x2000 recordings): 0, unknown (no gyro block): -1.
+// Decided from the frame's FPG2 block; kept per clip. why: the reason, for the Source line.
+int frame_binning(const std::string& dngPath, int rasterW, int rasterH, std::string& why);                                      // stops background scans (before the library unloads)
 
 // Loads (and caches) a sidecar file. dngPath (a frame of the clip) supplies the exposure time
 // when the file does not carry it.
 std::shared_ptr<const GyroClip> load_gyro(const std::string& fpgPath, std::string& error, const std::string& dngPath = std::string());
+// Raster, active area, frame rate, EXIF focal length and exposure time of a DNG, from its header.
+bool dng_geometry(const std::string& dngPath, ClipGeometry& geo);
 // EXIF ExposureTime of a DNG in seconds (0 = unknown).
 double dng_exposure(const std::string& dngPath);
 

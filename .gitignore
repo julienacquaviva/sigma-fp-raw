@@ -7,4 +7,6 @@ __pycache__/
 # a DNG header with the camera serial number, and test reports.
 tests/A001_065_f102_row_phase_before_after.png
 tests/data/frame_header.bin
+tests/data/frame_header_r122.bin
+tests/scratch/
 tests/*_report.json

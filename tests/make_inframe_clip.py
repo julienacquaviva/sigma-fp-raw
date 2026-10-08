@@ -38,14 +38,18 @@ def read_fpg(path):
 
 def make_block(frame, clock_us, samples, *, ring_index=0, flags=0, lost=0, take=1, readout_us=24833, mark_delay_us=17416,
                sensor_mode=3, resolution=4, dc_crop=0, bit_depth=12, axes=(2, -1, 3), lsb=131, version=1, magic=b'FPG2',
-               header_bytes=48, n=None):
-    """The block of one frame, byte for byte as in section 3 of the spec."""
+               header_bytes=48, n=None, trailer=None):
+    """The block of one frame, byte for byte as in section 3 of the spec. trailer: (window w, h,
+    recorded w, h) written at block offset 3056 as R124 does (section 7)."""
     samples = np.asarray(samples, np.int16).reshape(-1, 3)
     h = bytearray(48)
     struct.pack_into('<4sHHIIHHHHIIiH4B3bBH', h, 0, magic, version, header_bytes, frame & 0xFFFFFFFF, clock_us & 0xFFFFFFFF,
                      len(samples) if n is None else n, ring_index, flags, min(lost, 65535), take & 0xFFFFFFFF, readout_us,
                      mark_delay_us, sensor_mode, resolution, dc_crop, bit_depth, 0, *axes, 0, lsb)
     out = bytes(h) + samples.astype('<i2').tobytes()
+    if trailer is not None:
+        assert len(out) <= 3056
+        out = out + bytes(3056 - len(out)) + struct.pack('<4H', *trailer)
     assert len(out) <= REGION, 'block does not fit the region'
     return out
 
