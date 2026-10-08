@@ -800,13 +800,16 @@ OfxStatus clip_preferences(OfxImageEffectHandle h, OfxPropertySetHandle out) {
     return kOfxStatOK;
 }
 
-// The node's frame is the timeline frame. Only said when the source clip's own frame differs
-// from it (then Fit Width / Fit Height need the room); otherwise the host's default stands.
+// The node's frame as the timeline frame: asked for only with Fit Width / Fit Height, which need
+// the room beyond the clip's own frame, and only when that frame differs from the timeline's.
+// With Scale to Fit (the default) the host's own frame stands: a clip of another shape than the
+// timeline must come out exactly where the host puts it.
 OfxStatus region_of_definition(OfxImageEffectHandle h, OfxPropertySetHandle args, OfxPropertySetHandle out) {
     Instance* in = instance(h);
     if (!in) return kOfxStatReplyDefault;
     double time = 0, size[2] = {0, 0}, off[2] = {0, 0};
     gProp->propGetDouble(args, kOfxPropTime, 0, &time);
+    if (ival(*in, "fitMode", time) == 0) return kOfxStatReplyDefault;
     if (gProp->propGetDoubleN(effect_props(h), kOfxImageEffectPropProjectSize, 2, size) != kOfxStatOK || !(size[0] > 0 && size[1] > 0)) return kOfxStatReplyDefault;
     gProp->propGetDoubleN(effect_props(h), kOfxImageEffectPropProjectOffset, 2, off);
     OfxRectD src{};

@@ -1,5 +1,13 @@
 # Sigma fp RAW: changes by version
 
+## New in 1.9.5
+
+- Develop RAW off: the host's picture is taken as the clip's whole frame, whatever shape the DNG's crop tags give (a clip
+  whose tags said 16:9 while Resolve showed it 2:1 was cut to 16:9 with black bars).
+
+- The node's frame is asked to be the timeline frame only with Fit Width / Fit Height; with Scale to Fit the host's own
+  frame stands (a 2:1 clip in a 16:9 timeline was reported cropped with the default settings).
+
 ## New in 1.9.4
 
 - Mac: the GPU develops the picture, through Metal (Apple Silicon and Intel). The kernels are compiled on the Mac at the

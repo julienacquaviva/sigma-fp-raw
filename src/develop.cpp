@@ -308,28 +308,29 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
         for (int i = 0; i < 7; ++i) dp.lens.c[i] = static_cast<float>(w->c[i]);
     }
     if (source) {
-        // The planes are the host's picture; the clip's frame sits in it scaled to fit and
-        // centred. Everything measured in raster pixels moves to that picture's pixels.
+        // The planes are the host's picture, and the clip's frame is all of it: the host hands a
+        // node the clip's own frame (it places that frame in the timeline afterwards). Its shape
+        // is the host's reading of the file, which need not be this reader's (a DNG whose crop
+        // tags say another shape than the host shows): the picture is never cut to the tags.
+        // Everything measured in raster pixels moves to that picture's pixels.
         if (source->width <= 0 || source->height <= 0 || source->rodW <= 0 || source->rodH <= 0 || (!source->device && !source->host)) { e = "Bad source image"; return false; }
-        const double k = std::min(static_cast<double>(source->rodW) / info.cropW, static_cast<double>(source->rodH) / info.cropH);
-        const double picW = info.cropW * k, picH = info.cropH * k;
-        const double px0 = (source->rodW - picW) / 2 - source->offX, py0 = (source->rodH - picH) / 2 - source->offTop;
+        const double k = static_cast<double>(source->width) / info.cropW, ky = static_cast<double>(source->height) / info.cropH;
+        const double picW = source->width, picH = source->height;
+        const double px0 = 0, py0 = 0;
         const double rcx = info.activeLeft + info.cropX, rcy = info.activeTop + info.cropY;
         dp.W = source->width; dp.H = source->height;
-        dp.cropX = std::clamp(static_cast<int>(std::lround(px0)), 0, dp.W - 1);
-        dp.cropY = std::clamp(static_cast<int>(std::lround(py0)), 0, dp.H - 1);
-        dp.cropW = std::clamp(static_cast<int>(std::lround(picW)), 1, dp.W - dp.cropX);
-        dp.cropH = std::clamp(static_cast<int>(std::lround(picH)), 1, dp.H - dp.cropY);
+        dp.cropX = 0; dp.cropY = 0;
+        dp.cropW = dp.W; dp.cropH = dp.H;
         if (dp.stab.on) {
             dp.stab.focal *= static_cast<float>(k);
             dp.stab.cx = static_cast<float>(px0 + (dp.stab.cx - rcx) * k);
-            dp.stab.cy = static_cast<float>(py0 + (dp.stab.cy - rcy) * k);
-            dp.stab.rows *= static_cast<float>(k);
-            dp.stab.row0 = static_cast<float>(py0 - rcy * k);
+            dp.stab.cy = static_cast<float>(py0 + (dp.stab.cy - rcy) * ky);
+            dp.stab.rows *= static_cast<float>(ky);
+            dp.stab.row0 = static_cast<float>(py0 - rcy * ky);
         }
         if (dp.lens.on) {
             dp.lens.cx = static_cast<float>(px0 + (dp.lens.cx - rcx) * k);
-            dp.lens.cy = static_cast<float>(py0 + (dp.lens.cy - rcy) * k);
+            dp.lens.cy = static_cast<float>(py0 + (dp.lens.cy - rcy) * ky);
             dp.lens.m *= static_cast<float>(k);
             dp.lens.invM = 1.f / dp.lens.m;
         }

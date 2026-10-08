@@ -61,7 +61,7 @@ def main():
     SCRATCH.mkdir(parents=True)
     cw, ch = 3000, 2000                                   # the clip's frame (3:2)
     dng = MD.write_dng(SCRATCH / 'SYN_PT_000001.DNG', cw, ch)
-    W, H = 1920, 1080                                     # the timeline: the frame sits in it 1620 x 1080, pillarboxed
+    W, H = 1620, 1080                                     # the node's frame is the clip's own frame (the host places it in the timeline afterwards)
     pw, ph = 1620, 1080
     img, (x0, y0) = picture(W, H, pw, ph)
 
@@ -100,7 +100,7 @@ def main():
     host.set(xfZoomX=2.0, xfZoomY=2.0, resampling=1)
     status, z = host.render(source_frame=0)
     zoomed = z.pixels[::-1][..., :3]
-    yy, xx = np.mgrid[100:980:7, 100:1820:7]
+    yy, xx = np.mgrid[100:980:7, 100:W - 100:7]
     sx, sy = (xx + 0.5 - W / 2) / 2 + W / 2 - 0.5, (yy + 0.5 - H / 2) / 2 + H / 2 - 0.5
     fx, fy = (sx - np.floor(sx))[..., None], (sy - np.floor(sy))[..., None]
     ix, iy = np.floor(sx).astype(int), np.floor(sy).astype(int)
@@ -123,7 +123,7 @@ def main():
     status, d = host.render(source_frame=0)
     dist = d.pixels[::-1][..., :3]
     radius = 12.0 / (35.9 / 6000) * (pw / 6048.0)          # 12 mm in sensor pixels, then in picture pixels (the frame shows the whole sensor width)
-    yy, xx = np.mgrid[60:1020:9, 200:1720:9]
+    yy, xx = np.mgrid[60:1020:9, 60:W - 60:9]
     dx, dy = (xx + 0.5 - W / 2) / radius, (yy + 0.5 - H / 2) / radius
     f = 1 - k1 + k1 * (dx * dx + dy * dy)
     sx, sy = W / 2 + dx * f * radius - 0.5, H / 2 + dy * f * radius - 0.5
@@ -222,6 +222,18 @@ def main():
         print('SKIP stabilisation -', e)
 
     host.close()
+    # A file whose crop tags give another shape than the host shows (seen: a 2:1 picture with 16:9 tags): the host's
+    # picture still goes through whole, nothing is cut to the tags.
+    wide = OFXHost(PLUGIN, canvas=(2000, 1000))
+    wide.obj(wide.obj(wide.instance)['props'])['values']['OfxImageEffectPropSrcFilePath'] = [str(dng)]
+    wide.changed('Source')
+    wimg, _ = picture(2000, 1000, 2000, 1000, seed=5)
+    keep2 = give_source(wide, wimg)
+    status, wout = wide.render(source_frame=0)
+    assert status == OK and np.array_equal(wout.pixels[::-1][..., :3], wimg[..., :3])
+    wide.close()
+    ok('a node frame of another shape than the file says (2:1 frame, 3:2 file): the host picture comes out whole, bit for bit')
+
     if not CPU_PART:
         env = dict(os.environ, SFP_CPU='1')
         r = subprocess.run([sys.executable, str(Path(__file__).resolve())], env=env, capture_output=True, text=True)

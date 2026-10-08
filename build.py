@@ -17,7 +17,7 @@ import argparse, hashlib, json, os, shutil, stat, struct, subprocess, sys, zipfi
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '1.9.4'
+VERSION = '1.9.5'
 PLUGIN_ID = 'com.sigmafpmods.raw'
 CORE = ['dng.cpp', 'lj92.cpp', 'color.cpp', 'cuda_api.cpp', 'frame_cache.cpp', 'develop.cpp', 'kernels_cpu.cpp',
         'gyro.cpp', 'gyro_inframe.cpp', 'platform.cpp', 'lens_profile.cpp']

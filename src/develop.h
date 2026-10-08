@@ -84,7 +84,7 @@ struct Target {
 
 // The host's own picture of the clip (its Source image), for developing switched off: the
 // plug-in then only frames, stabilises and straightens that picture. The clip's frame is taken
-// to sit in it as the host's default input scaling puts it: whole, centred, scaled to fit.
+// to be the whole of that picture.
 struct SourceImage {
     CUdeviceptr device = 0;      // device image (host CUDA render), or 0
     const void* host = nullptr;  // host image

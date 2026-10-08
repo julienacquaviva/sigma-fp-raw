@@ -1,7 +1,6 @@
 ## What's new
 
-- **Mac: GPU acceleration.** On a Mac (Apple Silicon and Intel) the picture is now developed on the GPU through Metal instead of the processor. If Metal cannot be used, the plug-in falls back to the processor by itself. Tested on GitHub's Apple Silicon machines, where the GPU's picture matches the processor's; not yet tried inside DaVinci Resolve on a Mac, so reports are welcome in the issue tracker.
-- Windows and Linux: unchanged.
+- **Fix: with Develop RAW off, some clips came out with black bars at the sides** (seen on a 2:1 clip, cut to 16:9). Resolve's picture now always goes through whole.
 
 ## Downloads
 
