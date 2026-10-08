@@ -16,7 +16,7 @@ own decoder. You put it on the first node of the clip and grade after it.
 - **Gyro stabilisation and rolling-shutter correction** with no setup, for clips that carry gyro data.
 - **Lens correction**: vignette and distortion from the lens's own profile in the clip, from the Adobe lens profiles installed on the computer, or from a profile file (DNG, Adobe `.lcp`, Lensfun `.xml`).
 - **Your colour pipeline or the plug-in's**: by default the picture and the colour stay Resolve's own and the plug-in adds framing, stabilisation and lens correction; tick *Develop RAW* for the plug-in's own development.
-- **Windows, macOS and Linux.** No NVIDIA card? It develops on the processor instead, with the same picture.
+- **Windows, macOS and Linux.** On a Mac the GPU does the work through Metal. No NVIDIA card and no Mac? It develops on the processor instead, with the same picture.
 
 ## Download and install
 
@@ -159,7 +159,7 @@ How the sync, the rolling-shutter model and the zoom work, with measurements, is
 - **The effect is not in the list.** Check that `SigmaFpRaw.ofx.bundle` sits directly in the OFX plug-in folder, then restart Resolve. *Preferences > Video Plugins* lists plug-ins that failed to load.
 - **macOS says the plug-in is damaged or from an unidentified developer.** Run the `xattr` command from the install section.
 - **"No DNG source".** Apply the effect to the original CinemaDNG clip on the Color page, not to a render or a compound clip.
-- **Playback is slow.** Without an NVIDIA card the processor does the work. Set *Decode Quality* to Half Res., or render a cache.
+- **Playback is slow.** Without an NVIDIA card or a Mac's GPU the processor does the work. Set *Decode Quality* to Half Res., or render a cache.
 
 ## Build from source
 
