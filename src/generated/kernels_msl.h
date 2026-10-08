@@ -714,7 +714,7 @@ SFP_DEV void sample_k(SFP_D const float* R, SFP_D const float* G, SFP_D const fl
         int ax = clampi((int)floorf(fx), x0c, x1c), bx = clampi((int)floorf(fx) + 1, x0c, x1c);
         int ay = clampi((int)floorf(fy), y0c, y1c), by = clampi((int)floorf(fy) + 1, y0c, y1c);
         const size_t i00 = (size_t)ay * W + ax, i01 = (size_t)ay * W + bx, i10 = (size_t)by * W + ax, i11 = (size_t)by * W + bx;
-        const float* P[3] = {R, G, B};
+        SFP_D const float* P[3] = {R, G, B};
         for (int c = 0; c < 3; ++c) {
             const float lo = fminf(fminf(P[c][i00], P[c][i01]), fminf(P[c][i10], P[c][i11]));
             const float hi = fmaxf(fmaxf(P[c][i00], P[c][i01]), fmaxf(P[c][i10], P[c][i11]));
