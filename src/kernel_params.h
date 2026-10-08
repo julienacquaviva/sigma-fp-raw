@@ -1,5 +1,45 @@
-// Parameter blocks shared by the host and the CUDA kernels (4-byte fields only).
+// Parameter blocks shared by the host and the kernels (4-byte fields only), and the mappings both
+// sides use. The kernels are one source for three compilers: CUDA (NVRTC), Metal Shading Language
+// (compiled on the Mac at run time) and plain C++ (the processor path, and the host).
 #pragma once
+
+// Address spaces: Metal wants every pointer and reference parameter to say where it points.
+// SFP_D: into a buffer of the GPU; SFP_T: to a local of the calling function; SFP_C: into a
+// parameter block. Nothing for the other compilers.
+#if defined(__METAL_VERSION__)
+#define SFP_D device
+#define SFP_T thread
+#define SFP_C constant
+#define SFP_FN
+#define SFP_I64 long
+#define fabsf fabs
+#define fmaxf fmax
+#define fminf fmin
+#define floorf floor
+#define ceilf ceil
+#define powf pow
+#define sqrtf sqrt
+#define expf exp
+#define logf log
+#define log2f log2
+#define exp2f exp2
+#define sinf sin
+#define cosf cos
+#define tanhf tanh
+#elif defined(__CUDACC__)
+#define SFP_D
+#define SFP_T
+#define SFP_C
+#define SFP_FN __device__ __forceinline__
+#define SFP_I64 long long
+#else
+#include <cmath>
+#define SFP_D
+#define SFP_T
+#define SFP_C
+#define SFP_FN inline
+#define SFP_I64 long long
+#endif
 
 struct PrepParams {
     int W, H;
@@ -28,17 +68,11 @@ struct StabParams {
     float row0;           // raster row the readout starts at (0, except for a picture placed inside a larger image)
 };
 
-#ifdef __CUDACC__
-#define SFP_FN __device__ __forceinline__
-#else
-#include <cmath>
-#define SFP_FN inline
-#endif
 
 // Raster position (x, y) of the stabilised image -> raster position in the recorded frame.
 // The row that was read at the matching time is found by fixed-point iteration (the
 // vertical correction is far smaller than the frame, so three rounds are enough).
-SFP_FN void stab_map(const StabParams& s, float x, float y, float* ox, float* oy) {
+SFP_FN void stab_map(SFP_C const StabParams& s, float x, float y, SFP_T float* ox, SFP_T float* oy) {
     float px = (x - s.cx) * s.invZoom, py = (y - s.cy) * s.invZoom, pz = s.focal;
     float sx = x, sy = y;
     for (int it = 0; it < 3; ++it) {
@@ -47,10 +81,8 @@ SFP_FN void stab_map(const StabParams& s, float x, float y, float* ox, float* oy
         int k = (int)kf;
         if (k > STAB_KNOTS - 2) k = STAB_KNOTS - 2;
         float t = kf - (float)k;
-        const float* a = s.rot + 9 * k;
-        const float* b = a + 9;
         float m[9];
-        for (int i = 0; i < 9; ++i) m[i] = a[i] + t * (b[i] - a[i]);
+        for (int i = 0; i < 9; ++i) m[i] = s.rot[9 * k + i] + t * (s.rot[9 * k + 9 + i] - s.rot[9 * k + i]);
         float qx = m[0] * px + m[1] * py + m[2] * pz;
         float qy = m[3] * px + m[4] * py + m[5] * pz;
         float qz = m[6] * px + m[7] * py + m[8] * pz;
@@ -70,7 +102,7 @@ struct LensParams {
     float c[7];       // radial factor: sum of c[i] r^i
 };
 
-SFP_FN void lens_map(const LensParams& l, float x, float y, float* ox, float* oy) {
+SFP_FN void lens_map(SFP_C const LensParams& l, float x, float y, SFP_T float* ox, SFP_T float* oy) {
     const float dx = (x - l.cx) * l.invM, dy = (y - l.cy) * l.invM;
     const float r = sqrtf(dx * dx + dy * dy);
     const float f = l.c[0] + r * (l.c[1] + r * (l.c[2] + r * (l.c[3] + r * (l.c[4] + r * (l.c[5] + r * l.c[6])))));
@@ -125,7 +157,7 @@ enum { kResampleBilinear = 0, kResampleCatmullRom = 1, kResampleLanczos2 = 2, kR
 // at +0.5) to the position in the fitted (untransformed) frame. False when the point lies
 // behind the viewer (pitch / yaw beyond 90 degrees). One mapping for the GPU, the processor and
 // the tests, so the picture is resampled once, wherever it is computed.
-SFP_FN bool xform_map(const DevelopParams& p, float ix, float iy, float* ox, float* oy) {
+SFP_FN bool xform_map(SFP_C const DevelopParams& p, float ix, float iy, SFP_T float* ox, SFP_T float* oy) {
     const float u = ix - 0.5f * (float)p.rodW, v = 0.5f * (float)p.rodH - iy;
     const float X = p.xf[0] * u + p.xf[1] * v + p.xf[2];
     const float Y = p.xf[3] * u + p.xf[4] * v + p.xf[5];

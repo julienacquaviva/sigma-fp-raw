@@ -34,7 +34,9 @@
 #include <vector>
 
 #include "../src/develop.h"
+#include "../src/develop_metal.h"
 #include "../src/gyro.h"
+#include "../src/platform.h"
 #include "../src/lens_profile.h"
 
 using namespace sfp;
@@ -356,6 +358,104 @@ static int selftest(const char* fpg) {
         else {
             std::printf("gyro file: %lld frames, %.2f Hz\n", static_cast<long long>(clip->frames()), clip->h.rateHz);
             if (clip->frames() < 1) ok = false;
+        }
+    }
+    // The GPU's picture against the processor's, over the paths the plug-in uses. On GitHub's
+    // machines a failure is also written as an annotation of the run (readable without its log).
+    auto annotate = [](const char* level, std::string text) {
+        if (os::env("GITHUB_ACTIONS").empty()) return;
+        for (size_t at = 0; (at = text.find('\n', at)) != std::string::npos;) text.replace(at, 1, "%0A");
+        std::printf("::%s title=GPU self-test::%s\n", level, text.substr(0, 3000).c_str());
+    };
+#ifdef SFP_METAL
+    {
+        const std::string status = metal_status();
+        std::printf("metal: %s\n", status.c_str());
+        if (!metal_available()) {
+            // A machine without a GPU is not a fault of the build; kernels that do not compile are.
+            const bool fault = status.find("no Metal device") == std::string::npos && status.find("switched off") == std::string::npos;
+            annotate(fault ? "error" : "warning", "Metal is not used: " + status);
+            if (fault) ok = false;
+        }
+    }
+#endif
+    if (std::string(Developer::backend()) != "CPU") {
+        const int OW = 600, OH = 400;                       // another size than the frame: the picture is resampled
+        std::vector<float> host(static_cast<size_t>(W) * H * 4);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* px = &host[(static_cast<size_t>(y) * W + x) * 4];
+                px[0] = 0.1f + 0.7f * x / W; px[1] = 0.15f + 0.6f * y / H; px[2] = 0.4f + 0.3f * std::sin(x / 29.f) * std::cos(y / 17.f); px[3] = 1;
+            }
+        const char* names[] = {"full resolution", "half resolution", "stabilised, straightened, transformed, graded", "3K corrections", "Resolve's picture, vignette removed"};
+        uint64_t id = 100;
+        for (int c = 0; c < 5; ++c) {
+            auto render = [&](std::vector<float>& img, double& ms) {
+                RawSettings s;
+                Frame g = f;
+                g.id = ++id;
+                SourceImage src;
+                if (c == 1) s.decodeQuality = 1;
+                if (c == 2 || c == 4) {
+                    s.stab.on = 1; s.stab.focal = 900; s.stab.cx = W / 2.f; s.stab.cy = H / 2.f; s.stab.rows = H; s.stab.invZoom = 0.9f;
+                    for (int k = 0; k < STAB_KNOTS; ++k) {
+                        const float a = 0.01f + 0.0004f * k, cs = std::cos(a), sn = std::sin(a);   // a small roll that changes down the frame
+                        float* r = s.stab.rot + 9 * k;
+                        r[0] = cs; r[1] = -sn; r[3] = sn; r[4] = cs; r[8] = 1;
+                    }
+                    s.lensDistortion = true;
+                    s.lensProfile.valid = true;
+                    s.lensProfile.c[0] = 0.99; s.lensProfile.c[1] = 0.01; s.lensProfile.c[2] = -0.05; s.lensProfile.c[4] = 0.02;
+                    s.xf.zoomX = s.xf.zoomY = 1.15; s.xf.rotation = 3; s.xf.posX = 7; s.xf.pitch = 4;
+                }
+                if (c == 2) {
+                    s.gamma = Gamma::Rec709; s.sharpness = 40; s.contrast = 60; s.highlights = -30; s.shadows = 20; s.saturation = 60; s.colorBoost = 20;
+                    s.midtones = 10; s.lift = 5; s.gain = 5; s.exposure = 0.5; s.highlightRecovery = s.gamutMapping = s.preToneCurve = s.softClip = true;
+                } else {
+                    s.gamma = Gamma::Linear;
+                }
+                if (c == 3) { s.binned = 1; s.deZigzag = 80; s.rowPhase = -0.125; g.info.width = 640; }
+                if (c == 4) {
+                    src.host = host.data(); src.width = W; src.height = H; src.rowBytes = W * 16; src.rodW = W; src.rodH = H;
+                    s.sourceGamma = 6;
+                    s.sourceVignette.rows = s.sourceVignette.cols = 9; s.sourceVignette.planes = 1;
+                    for (int i = 0; i < 9; ++i)
+                        for (int j = 0; j < 9; ++j) s.sourceVignette.gain.push_back(1.f + 0.05f * ((i - 4) * (i - 4) + (j - 4) * (j - 4)) / 8.f);
+                }
+                img.assign(static_cast<size_t>(OW) * OH * 4, -1.f);
+                Target t;
+                t.host = img.data(); t.width = OW; t.height = OH; t.rowBytes = OW * 16; t.rodW = OW; t.rodH = OH;
+                std::string err;
+                DevelopTiming tm;
+                if (!Developer::get().develop(g, s, nullptr, t, err, &tm, c == 4 ? &src : nullptr)) { std::printf("FAIL develop (%s): %s\n", names[c], err.c_str()); return false; }
+                ms = tm.gpuMs;
+                return true;
+            };
+            std::vector<float> gpu, cpu;
+            double gpuMs = 0, cpuMs = 0;
+            const std::string backend = Developer::backend();
+            bool done = render(gpu, gpuMs);
+            Developer::force_cpu(true);
+            done = done && render(cpu, cpuMs);
+            Developer::force_cpu(false);
+            if (!done) { ok = false; annotate("error", std::string("develop failed: ") + names[c]); continue; }
+            double worst = 0, sum = 0;
+            int nonFinite = 0;
+            for (size_t i = 0; i < gpu.size(); ++i) {
+                if (!std::isfinite(gpu[i])) { ++nonFinite; continue; }
+                const double d = std::fabs(gpu[i] - cpu[i]);
+                worst = std::fmax(worst, d);
+                sum += d;
+            }
+            const bool same = worst < 0.02 && sum / gpu.size() < 2e-4 && nonFinite == 0;
+            std::printf("%s vs CPU, %s: largest difference %.6f, mean %.7f, non-finite %d, %.1f ms (CPU %.1f ms)%s\n", backend.c_str(), names[c], worst,
+                        sum / gpu.size(), nonFinite, gpuMs, cpuMs, same ? "" : "  <-- DIFFERENT");
+            if (!same) {
+                ok = false;
+                char buf[300];
+                std::snprintf(buf, sizeof buf, "%s differs from the CPU, %s: largest %.6f, mean %.7f, non-finite %d", backend.c_str(), names[c], worst, sum / gpu.size(), nonFinite);
+                annotate("error", buf);
+            }
         }
     }
     std::puts(ok ? "PASS" : "FAIL");

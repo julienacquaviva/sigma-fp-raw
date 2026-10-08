@@ -4,7 +4,7 @@ name: build
 # on a version tag (v1.4.0) publishes the installers as a GitHub release.
 on:
   push:
-    branches: [main]
+    branches: [main, metal]
     tags: ['v*']
   pull_request:
   workflow_dispatch:

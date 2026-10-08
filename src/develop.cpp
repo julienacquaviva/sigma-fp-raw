@@ -1,6 +1,7 @@
 #include "develop.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "develop_cpu.h"
+#include "develop_metal.h"
 #include "platform.h"
 
 #ifdef __APPLE__
@@ -118,7 +120,12 @@ Developer& Developer::get() {
     static Developer dev;
     return dev;
 }
-const char* Developer::backend() { return os::env("SFP_CPU") != "1" && cuda().ok ? "CUDA (GPU)" : "CPU"; }
+static std::atomic<bool> gForceCpu{false};
+void Developer::force_cpu(bool on) { gForceCpu = on; }
+const char* Developer::backend() {
+    if (os::env("SFP_CPU") == "1" || gForceCpu) return "CPU";
+    return cuda().ok ? "CUDA (GPU)" : metal_available() ? "Metal (GPU)" : "CPU";
+}
 
 // The brightness plane of a shading map (over the whole 6048 x 4032 sensor) as a radial gain
 // 1 + a0 r^2 + a1 r^4 + a2 r^6 + a3 r^8, r = 1 at the sensor's corner (least squares).
@@ -369,12 +376,18 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
     dp.gain = static_cast<float>(1.0 + std::clamp(s.gain, -100.0, 100.0) / 100.0);
     dp.pedestal = pp.pedestal;
     // Without an NVIDIA CUDA driver (or with SFP_CPU=1) host images are developed on the CPU.
-    static const bool forceCpu = os::env("SFP_CPU") == "1";
+    static const bool envCpu = os::env("SFP_CPU") == "1";
+    const bool forceCpu = envCpu || gForceCpu;
     auto& cu = cuda();
     const void* srcHost = source ? source->host : nullptr;
     const int srcRow = source ? source->rowBytes : 0;
     if (!t.device && (forceCpu || !cu.ok)) {
         dp.rowBytes = t.rowBytes;
+        // A Mac: its GPU through Metal. Should that fail, the processor does this frame.
+        if (!forceCpu && metal_available()) {
+            std::string why;
+            if (develop_metal(f, s.decodeQuality, pp, dz, dp, t.host, why, timing, srcHost, srcRow)) return true;
+        }
         return develop_cpu(f, s.decodeQuality, pp, dz, dp, t.host, e, timing, srcHost, srcRow);
     }
     if (!cu.ok) { e = cu.error; return false; }

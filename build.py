@@ -73,7 +73,10 @@ def zig_build(zig, target, cpu, sources, out, shared):
 
 
 def apple_build(sources, out, shared):
-    cmd = ['clang++', *flags(), '-arch', 'arm64', '-arch', 'x86_64', '-mmacosx-version-min=11.0', '-fvisibility=hidden']
+    # With the Metal backend (Objective-C++, only where Apple's compiler and frameworks are).
+    sources = [*sources, ROOT / 'src/develop_metal.mm']
+    cmd = ['clang++', *flags(), '-DSFP_METAL=1', '-fobjc-arc', '-framework', 'Metal', '-framework', 'Foundation',
+           '-arch', 'arm64', '-arch', 'x86_64', '-mmacosx-version-min=11.0', '-fvisibility=hidden']
     if shared:
         cmd.append('-bundle')
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -192,6 +195,7 @@ def main():
         if n not in TARGETS:
             sys.exit(f'unknown target {n}')
     run([sys.executable, ROOT / 'tools/make_ptx.py'])
+    run([sys.executable, ROOT / 'tools/make_msl.py'])
     zig = None if names == ['macos'] and HOST == 'macos' else find_zig()
     bundle = ROOT / 'dist/SigmaFpRaw.ofx.bundle'
     built = {n: build_target(n, zig, bundle) for n in names}

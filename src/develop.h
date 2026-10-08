@@ -110,8 +110,10 @@ public:
     bool develop(const Frame& f, const RawSettings& s, CUstream stream, const Target& t,
                  std::string& error, DevelopTiming* timing = nullptr, const SourceImage* source = nullptr);
     static Developer& get();
-    // "CUDA (GPU)" or "CPU": what develops host images on this machine.
+    // "CUDA (GPU)", "Metal (GPU)" or "CPU": what develops host images on this machine.
     static const char* backend();
+    // Tests: true = develop on the processor whatever the machine has (as SFP_CPU=1 does); false = back to normal.
+    static void force_cpu(bool on);
 
 private:
     struct Impl;
