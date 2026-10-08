@@ -65,7 +65,13 @@ bool init(State& x) {
     x.tried = true;
     if (os::env("SFP_METAL") == "0") { x.error = "switched off (SFP_METAL=0)"; return false; }
     @autoreleasepool {
+        // The default device needs Core Graphics linked in (a command-line tool has none by
+        // itself); should it still be missing, any device of the machine will do.
         x.device = MTLCreateSystemDefaultDevice();
+        if (!x.device) {
+            NSArray<id<MTLDevice>>* all = MTLCopyAllDevices();
+            if (all.count) x.device = all[0];
+        }
         if (!x.device) { x.error = "no Metal device"; return false; }
         x.name = x.device.name ? std::string(x.device.name.UTF8String) : "GPU";
         x.queue = [x.device newCommandQueue];

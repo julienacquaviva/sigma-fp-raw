@@ -75,7 +75,7 @@ def zig_build(zig, target, cpu, sources, out, shared):
 def apple_build(sources, out, shared):
     # With the Metal backend (Objective-C++, only where Apple's compiler and frameworks are).
     sources = [*sources, ROOT / 'src/develop_metal.mm']
-    cmd = ['clang++', *flags(), '-DSFP_METAL=1', '-fobjc-arc', '-framework', 'Metal', '-framework', 'Foundation',
+    cmd = ['clang++', *flags(), '-DSFP_METAL=1', '-fobjc-arc', '-framework', 'Metal', '-framework', 'Foundation', '-framework', 'CoreGraphics',
            '-arch', 'arm64', '-arch', 'x86_64', '-mmacosx-version-min=11.0', '-fvisibility=hidden']
     if shared:
         cmd.append('-bundle')
