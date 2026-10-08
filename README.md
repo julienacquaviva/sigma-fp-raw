@@ -74,7 +74,7 @@ machines for every change, but they have not yet been tried inside DaVinci Resol
 
 1. **Color page**: open *Effects*, find **Sigma fp RAW** in the *Sigma fp* group, and drop it on the **first node** of a Sigma fp CinemaDNG clip. Grade on the nodes after it.
 2. Choose who develops the picture, with **Develop RAW** in the *Camera RAW* group:
-   - **Off (the default)**: the picture and the colour are Resolve's own. Its Camera RAW settings (for example Blackmagic Design colour space and Blackmagic Design Film gamma), your colour management and your PowerGrades work as without the plug-in. The plug-in adds the Transform, the stabilisation and the lens corrections on that picture. Leave Resolve's input scaling at *Scale to Fit*. For the Vignette Correction, set **Resolve Gamma** to the Gamma of Resolve's Camera RAW panel.
+   - **Off (the default)**: the picture and the colour are Resolve's own. Its Camera RAW settings (for example Blackmagic Design colour space and Blackmagic Design Film gamma), your colour management and your PowerGrades work as without the plug-in. The plug-in adds the Transform, the stabilisation and the lens corrections on that picture. If Resolve scales mismatched clips to fill the frame, set **Resolve Input Scaling** to *Fill*. For the Vignette Correction, set **Resolve Gamma** to the Gamma of Resolve's Camera RAW panel.
    - **On**: the plug-in develops the original DNG frames itself, at full resolution, with its own Camera RAW controls, the Sigma fp 3K fixes and the colour shading correction; Resolve's Camera RAW settings then do nothing. Set *Project Settings > Camera RAW > CinemaDNG > Decode Quality* to **Quarter Res.** (Resolve's picture is not used, so the lowest quality only saves time). Unmanaged timeline: leave the plug-in at Rec.709 / Rec.709. DaVinci Wide Gamut timeline: *Color Space* **DaVinci Wide Gamut** and *Gamma* **DaVinci Intermediate**.
 
 *Clip Info* at the top of the panel shows the clip, shutter speed and angle, ISO, frame rate, aspect ratio, bit depth, the sensor window and the recorded resolution, the focal length and the crop against full frame.
@@ -86,6 +86,7 @@ machines for every change, but they have not yet been tried inside DaVinci Resol
 | Control | What it does |
 |---|---|
 | Develop RAW | Off (default): Resolve's own picture and colour are kept; the controls below do nothing. On: the plug-in develops the DNG frames with them. |
+| Resolve Input Scaling | Develop RAW off only: how Resolve places a clip of another shape than the timeline, *Scale to Fit* (its default) or *Fill*. Needed for the stabilisation and the lens corrections to line up. |
 | Resolve Gamma | Develop RAW off only, for the Vignette Correction: the Gamma of Resolve's Camera RAW panel (Linear, 2.2, 2.4, 2.6, Rec.709, sRGB, Blackmagic Design Film, 4K Film, 4.6K Film, DaVinci Intermediate, ACEScct) |
 | Decode Quality | *Full Res.* (RCD demosaic) or *Half Res.* (2×2 binned, fastest) |
 | White Balance | As Shot, Daylight, Cloudy, Shade, Tungsten, Fluorescent, Flash, Custom. Editing *Color Temp* or *Tint* switches to Custom. |

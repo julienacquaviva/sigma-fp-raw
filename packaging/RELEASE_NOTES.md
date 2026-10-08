@@ -1,6 +1,6 @@
 ## What's new
 
-- **Fix: with Develop RAW off, some clips came out with black bars at the sides** (seen on a 2:1 clip, cut to 16:9). Resolve's picture now always goes through whole.
+- **Develop RAW off, clips of another shape than the timeline.** With stabilisation and lens corrections off, Resolve's picture now goes through untouched in every case. With them on, the plug-in needs to know how Resolve placed the clip: the new **Resolve Input Scaling** choice (Camera RAW group) is *Scale to Fit* (Resolve's default, bars beside the picture) or *Fill* ("Scale full frame with crop").
 
 ## Downloads
 

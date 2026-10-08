@@ -61,6 +61,7 @@ struct RawSettings {
     // that picture (ids of pt_decode in kernels.cu).
     GainMap sourceVignette;
     int sourceGamma = 4;
+    bool sourceFill = false;               // the host's input scaling fills the frame (crops the clip) instead of fitting it
     double renderScaleX = 1, renderScaleY = 1;
     StabParams stab{};                     // gyro stabilisation warp of this frame (gyro.h); on == 0: none
 };
@@ -83,8 +84,10 @@ struct Target {
 };
 
 // The host's own picture of the clip (its Source image), for developing switched off: the
-// plug-in then only frames, stabilises and straightens that picture. The clip's frame is taken
-// to be the whole of that picture.
+// plug-in then only frames, stabilises and straightens that picture. The host hands a node the
+// timeline's frame with the clip already placed in it by its input scaling: whole and centred
+// with bars (scale to fit), or filling the frame with its overhang cut (fill). Which of the two
+// is RawSettings::sourceFill; it cannot be read from the host.
 struct SourceImage {
     CUdeviceptr device = 0;      // device image (host CUDA render), or 0
     const void* host = nullptr;  // host image

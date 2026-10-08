@@ -61,7 +61,7 @@ def main():
     SCRATCH.mkdir(parents=True)
     cw, ch = 3000, 2000                                   # the clip's frame (3:2)
     dng = MD.write_dng(SCRATCH / 'SYN_PT_000001.DNG', cw, ch)
-    W, H = 1620, 1080                                     # the node's frame is the clip's own frame (the host places it in the timeline afterwards)
+    W, H = 1920, 1080                                     # the timeline: the frame sits in it 1620 x 1080, pillarboxed (scale to fit)
     pw, ph = 1620, 1080
     img, (x0, y0) = picture(W, H, pw, ph)
 
@@ -123,7 +123,7 @@ def main():
     status, d = host.render(source_frame=0)
     dist = d.pixels[::-1][..., :3]
     radius = 12.0 / (35.9 / 6000) * (pw / 6048.0)          # 12 mm in sensor pixels, then in picture pixels (the frame shows the whole sensor width)
-    yy, xx = np.mgrid[60:1020:9, 60:W - 60:9]
+    yy, xx = np.mgrid[60:1020:9, x0 + 50:x0 + pw - 50:9]
     dx, dy = (xx + 0.5 - W / 2) / radius, (yy + 0.5 - H / 2) / radius
     f = 1 - k1 + k1 * (dx * dx + dy * dy)
     sx, sy = W / 2 + dx * f * radius - 0.5, H / 2 + dy * f * radius - 0.5
@@ -222,17 +222,42 @@ def main():
         print('SKIP stabilisation -', e)
 
     host.close()
-    # A file whose crop tags give another shape than the host shows (seen: a 2:1 picture with 16:9 tags): the host's
-    # picture still goes through whole, nothing is cut to the tags.
+    # A clip the host scaled to fill a wider timeline (a 3:2 clip in a 2:1 frame: 2000 x 1333 of picture, 2000 x 1000 shown).
     wide = OFXHost(PLUGIN, canvas=(2000, 1000))
     wide.obj(wide.obj(wide.instance)['props'])['values']['OfxImageEffectPropSrcFilePath'] = [str(dng)]
     wide.changed('Source')
     wimg, _ = picture(2000, 1000, 2000, 1000, seed=5)
     keep2 = give_source(wide, wimg)
-    status, wout = wide.render(source_frame=0)
-    assert status == OK and np.array_equal(wout.pixels[::-1][..., :3], wimg[..., :3])
+    # Nothing switched on: the picture comes out whole and bit for bit, whatever the Input Scaling says.
+    for scaling in (0, 1):
+        wide.set(sourceScaling=scaling)
+        status, wout = wide.render(source_frame=0)
+        assert status == OK and np.array_equal(wout.pixels[::-1][..., :3], wimg[..., :3]), scaling
+    # Distortion correction with Input Scaling = Fill: nothing is blacked out, and the profile's centre and radius
+    # are those of the 2000 x 1333 picture (the frame shows the whole sensor width).
+    wide.set(sourceScaling=1, lensDistortion=1, lensDistortionFile=str(lf), resampling=1)
+    wide.changed('lensDistortionFile')
+    status, wd = wide.render(source_frame=0)
+    got = wd.pixels[::-1][..., :3]
+    radius = 12.0 / (35.9 / 6000) * (2000 / 6048.0)
+    yy, xx = np.mgrid[40:960:9, 40:1960:9]
+    dx, dy = (xx + 0.5 - 1000) / radius, (yy + 0.5 - 500) / radius
+    f = 1 - k1 + k1 * (dx * dx + dy * dy)
+    sx, sy = 1000 + dx * f * radius - 0.5, 500 + dy * f * radius - 0.5
+    fx, fy = (sx - np.floor(sx))[..., None], (sy - np.floor(sy))[..., None]
+    ix, iy = np.floor(sx).astype(int), np.floor(sy).astype(int)
+    inside = (ix >= 0) & (ix + 1 < 2000) & (iy >= 0) & (iy + 1 < 1000)
+    ix, iy = np.clip(ix, 0, 1998), np.clip(iy, 0, 998)
+    ref = wimg[iy, ix, :3] * (1 - fx) * (1 - fy) + wimg[iy, ix + 1, :3] * fx * (1 - fy) + wimg[iy + 1, ix, :3] * (1 - fx) * fy + wimg[iy + 1, ix + 1, :3] * fx * fy
+    err = float(np.abs(got[yy, xx] - ref)[inside].max())
+    assert status == OK and err < 3e-3 and float(got[500, 5:60].min()) > 0.01, err      # the sides are picture, not bars
+    # The same with Scale to Fit says the clip sits 1500 wide in the middle: its sides are then not picture.
+    wide.set(sourceScaling=0)
+    status, wf = wide.render(source_frame=0)
+    assert status == OK and float(np.abs(wf.pixels[::-1][400:600, 5:200, :3]).max()) == 0.0
     wide.close()
-    ok('a node frame of another shape than the file says (2:1 frame, 3:2 file): the host picture comes out whole, bit for bit')
+    del keep2
+    ok('a clip the host scaled to fill the frame: untouched with nothing on; lens correction lines up with Input Scaling = Fill', max_error=err)
 
     if not CPU_PART:
         env = dict(os.environ, SFP_CPU='1')

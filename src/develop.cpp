@@ -308,29 +308,41 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
         for (int i = 0; i < 7; ++i) dp.lens.c[i] = static_cast<float>(w->c[i]);
     }
     if (source) {
-        // The planes are the host's picture, and the clip's frame is all of it: the host hands a
-        // node the clip's own frame (it places that frame in the timeline afterwards). Its shape
-        // is the host's reading of the file, which need not be this reader's (a DNG whose crop
-        // tags say another shape than the host shows): the picture is never cut to the tags.
+        // The planes are the host's picture: the timeline's frame with the clip's frame placed in
+        // it by the host's input scaling, centred, at one scale k: the largest that shows it whole
+        // (scale to fit, bars beside it) or the smallest that fills the frame (fill, overhang cut).
         // Everything measured in raster pixels moves to that picture's pixels.
         if (source->width <= 0 || source->height <= 0 || source->rodW <= 0 || source->rodH <= 0 || (!source->device && !source->host)) { e = "Bad source image"; return false; }
-        const double k = static_cast<double>(source->width) / info.cropW, ky = static_cast<double>(source->height) / info.cropH;
-        const double picW = source->width, picH = source->height;
-        const double px0 = 0, py0 = 0;
+        const double fitK = std::min(static_cast<double>(source->width) / info.cropW, static_cast<double>(source->height) / info.cropH);
+        const double fillK = std::max(static_cast<double>(source->width) / info.cropW, static_cast<double>(source->height) / info.cropH);
+        const double k = s.sourceFill ? fillK : fitK;
+        const double picW = info.cropW * k, picH = info.cropH * k;
+        const double px0 = (source->width - picW) / 2, py0 = (source->height - picH) / 2;
         const double rcx = info.activeLeft + info.cropX, rcy = info.activeTop + info.cropY;
         dp.W = source->width; dp.H = source->height;
-        dp.cropX = 0; dp.cropY = 0;
-        dp.cropW = dp.W; dp.cropH = dp.H;
+        // Nothing to move (no stabilisation, no lens correction, the Transform and the Fit at
+        // their defaults): the host's picture goes through as it is, wherever the clip sits in
+        // it. Otherwise only the clip's frame is picture; what lies beside it stays black.
+        const bool untouched = !dp.stab.on && !dp.lens.on && !s.sourceVignette.valid() && s.xf.neutral() && s.fit == Fit::Fit;
+        if (untouched) {
+            dp.cropX = dp.cropY = 0;
+            dp.cropW = dp.W; dp.cropH = dp.H;
+        } else {
+            dp.cropX = std::clamp(static_cast<int>(std::lround(px0)), 0, dp.W - 1);
+            dp.cropY = std::clamp(static_cast<int>(std::lround(py0)), 0, dp.H - 1);
+            dp.cropW = std::clamp(static_cast<int>(std::lround(picW)), 1, dp.W - dp.cropX);
+            dp.cropH = std::clamp(static_cast<int>(std::lround(picH)), 1, dp.H - dp.cropY);
+        }
         if (dp.stab.on) {
             dp.stab.focal *= static_cast<float>(k);
             dp.stab.cx = static_cast<float>(px0 + (dp.stab.cx - rcx) * k);
-            dp.stab.cy = static_cast<float>(py0 + (dp.stab.cy - rcy) * ky);
-            dp.stab.rows *= static_cast<float>(ky);
-            dp.stab.row0 = static_cast<float>(py0 - rcy * ky);
+            dp.stab.cy = static_cast<float>(py0 + (dp.stab.cy - rcy) * k);
+            dp.stab.rows *= static_cast<float>(k);
+            dp.stab.row0 = static_cast<float>(py0 - rcy * k);
         }
         if (dp.lens.on) {
             dp.lens.cx = static_cast<float>(px0 + (dp.lens.cx - rcx) * k);
-            dp.lens.cy = static_cast<float>(py0 + (dp.lens.cy - rcy) * ky);
+            dp.lens.cy = static_cast<float>(py0 + (dp.lens.cy - rcy) * k);
             dp.lens.m *= static_cast<float>(k);
             dp.lens.invM = 1.f / dp.lens.m;
         }

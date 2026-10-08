@@ -246,6 +246,11 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     d.choice("sourceGamma", "Resolve Gamma", sg, 11, 4, "raw",
              "Develop RAW off only, for the Vignette Correction: the Gamma set in Resolve's own Camera RAW panel for this clip. The vignette is removed in "
              "linear light, so the plug-in has to know how Resolve's picture is encoded. A wrong choice makes the corners too bright or too dark.");
+    const char* sc[] = {"Scale to Fit", "Fill"};
+    d.choice("sourceScaling", "Resolve Input Scaling", sc, 2, 0, "raw",
+             "Develop RAW off only: how Resolve places a clip that has another shape than the timeline (Project Settings > Image Scaling > Mismatched "
+             "resolution files, or the clip's own Input Scaling). Scale to Fit: whole, with bars. Fill: 'Scale full frame with crop'. Needed for the "
+             "stabilisation and the lens corrections to line up; with those off the picture goes through unchanged either way.");
     const char* dq[] = {"Full Res. (RCD)", "Half Res."};
     d.choice("decodeQuality", "Decode Quality", dq, 2, 0, "raw", "Full: RCD demosaic at full resolution. Half: 2x2 binned, fastest.");
     d.choice("whiteBalance", "White Balance", WB_OPTIONS, 8, 0, "raw", "As Shot uses the camera's AsShotNeutral. Editing Color Temp or Tint switches to Custom.");
@@ -415,6 +420,7 @@ RawSettings settings(Instance& in, double t) {
     else if (fitMode == 2) s.fit = Fit::FitHeight;
     s.resampler = ival(in, "resampling", t) == 1 ? kResampleBilinear : kResampleLanczos3;
     s.lensDistortion = ival(in, "lensDistortion", t) != 0;
+    s.sourceFill = ival(in, "sourceScaling", t) == 1;
     s.xf.zoomX = dval(in, "xfZoomX", t);
     s.xf.zoomY = ival(in, "xfZoomLink", t) ? s.xf.zoomX : dval(in, "xfZoomY", t);
     s.xf.posX = dval(in, "xfPosX", t);
@@ -709,7 +715,7 @@ OfxStatus create_instance(OfxImageEffectHandle h) {
                           "stabRollingShutter", "stabSync", "stabFocal", "stabAutoZoom", "stabMaxZoom", "stabZoom", "gyroFile", "stabRange", "stabRangeStart", "stabRangeEnd",
                           "stabZoomMode", "stabZoomSmooth", "stabReadout", "stabFocalAuto", "stabReadoutAuto", "fitMode", "xfZoomX", "xfZoomY",
                           "xfZoomLink", "xfPosX", "xfPosY", "xfRotation", "xfAnchorX", "xfAnchorY", "xfPitch", "xfYaw", "xfFlipH", "xfFlipV", "resampling",
-                          "infoExposure", "infoFormat", "infoLens", "infoCorrection", "lensShading", "lensDistortion", "lensShadingFile", "lensDistortionFile", "developRaw", "sourceGamma"}) {
+                          "infoExposure", "infoFormat", "infoLens", "infoCorrection", "lensShading", "lensDistortion", "lensShadingFile", "lensDistortionFile", "developRaw", "sourceGamma", "sourceScaling"}) {
         OfxParamHandle p = nullptr;
         OfxPropertySetHandle pp = nullptr;
         if (gParam->paramGetHandle(ps, n, &p, &pp) != kOfxStatOK) return kOfxStatFailed;

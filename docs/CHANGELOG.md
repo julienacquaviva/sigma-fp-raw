@@ -1,5 +1,13 @@
 # Sigma fp RAW: changes by version
 
+## New in 1.9.6
+
+- Develop RAW off: the host's frame is the timeline's frame with the clip placed in it by the host's input scaling. The
+  placement is now a choice, Resolve Input Scaling (Scale to Fit / Fill); with nothing to move (no stabilisation, no lens
+  correction, Transform and Fit at their defaults) the host's picture is copied as it is. 1.9.5 took the whole frame as the
+  clip's frame, which put the stabilisation and the lens corrections out of place beside bars; 1.9.4 and earlier assumed
+  Scale to Fit and blacked out the sides of a clip that Resolve had scaled to fill.
+
 ## New in 1.9.5
 
 - Develop RAW off: the host's picture is taken as the clip's whole frame, whatever shape the DNG's crop tags give (a clip
