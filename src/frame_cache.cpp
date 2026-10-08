@@ -75,25 +75,21 @@ std::shared_ptr<Frame> load(const std::string& key, int threads, std::string& er
     if (!decode_raw(data.data(), data.size(), f->info, f->raw.data(), threads, error)) return nullptr;
     shading_window(path, f->info, f->profileW, f->profileH);
     if (shading) {
-        // The vignette: the picked file, else the frame's own, else the installed Adobe profile
-        // (lens_vignette). With a vignette from elsewhere the frame's map still gives the colour.
-        GainMap own = f->info.shading, map;
+        // The vignette: the picked file, else the frame's own map, else the installed Adobe profile
+        // (lens_vignette). Its brightness only, the same gain for the three colours: the colour
+        // part of the camera's map (red and blue against green) is not applied. On frames of the
+        // modified recording modes it puts green and magenta patches into a picture that has none
+        // without it (seen 2026-10-08; the raw data evidently does not carry that colour shading).
+        GainMap map;
         std::string note;
         bool ownColour = true;
         if (lens_vignette(vignetteFile, f->info, map, ownColour, note)) {
-            apply_shading(f->info, map, f->raw.data(), f->profileW, f->profileH);
-            f->shaded = true;
-            if (ownColour && own.valid() && own.planes == 3) {
-                for (size_t i = 0; i < own.gain.size(); i += 3) {
-                    const float g = own.gain[i + 1];
-                    own.gain[i] /= g; own.gain[i + 1] = 1; own.gain[i + 2] /= g;
-                }
-            } else {
-                own = GainMap{};
-            }
-        }
-        if (own.valid()) {
-            apply_shading(f->info, own, f->raw.data(), f->profileW, f->profileH);
+            GainMap brightness;
+            brightness.rows = map.rows; brightness.cols = map.cols; brightness.planes = 1;
+            brightness.areaW = map.areaW; brightness.areaH = map.areaH;
+            brightness.gain.resize(static_cast<size_t>(map.rows) * map.cols);
+            for (size_t i = 0; i < brightness.gain.size(); ++i) brightness.gain[i] = map.gain[i * map.planes + (map.planes == 3 ? 1 : 0)];
+            apply_shading(f->info, brightness, f->raw.data(), f->profileW, f->profileH);
             f->shaded = true;
         }
     }

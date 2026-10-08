@@ -67,13 +67,14 @@ def main():
     assert order[order.index('xform') + 1] == 'fitMode' and prop('fitMode', 'OfxParamPropParent') == 'xform'
     # 1.7.0: a Lens Correction group with two switches, both on.
     li = order.index('lens')
-    assert order[li:li + 6] == ['lens', 'infoCorrection', 'lensShading', 'lensDistortion', 'lensShadingFile', 'lensDistortionFile'] and host.get('lensShadingFile') == host.get('lensDistortionFile') == ''
+    shown_lens = [n for n in order[li:li + 9] if n == 'lens' or not prop(n, 'OfxParamPropSecret')]
+    assert shown_lens == ['lens', 'lensShading', 'sourceGamma', 'infoVignette', 'lensShadingFile', 'lensDistortion', 'infoDistortion', 'lensDistortionFile'], shown_lens and host.get('lensShadingFile') == host.get('lensDistortionFile') == ''
     # 1.9.3: the groups in the order Clip Info, Transform, Camera RAW, Lens Correction, Stabilisation.
     assert [n for n in order if n in groups] == ['clipInfo', 'xform', 'raw', 'lens', 'stab'], [n for n in order if n in groups]
     assert (host.get('lensShading'), host.get('lensDistortion')) == (0, 0)
     host.set(lensShading=1, lensDistortion=1)                 # as the reference of the tests below (the command-line tool's defaults)
     shown = sorted(n for n in params if not prop(n, 'OfxParamPropSecret') and prop(n, 'OfxParamPropParent') == 'raw')
-    assert 'highlightRecovery' not in shown and 'exposure' in shown and 'developRaw' in shown and 'sourceGamma' in shown and 'sourceScaling' in shown and len(shown) == 19, shown
+    assert 'highlightRecovery' not in shown and 'exposure' in shown and 'developRaw' in shown and 'sourceScaling' in shown and len(shown) == 18, shown
     ok('hidden: Highlight Recovery, Gamut Mapping, Pre Tone Curve, Soft Clip (all off), Frame Mapping (Resolve Source Frame), '
        'Timeline Anchor (0), Row Phase (-0.125), Edge Anti-aliasing (80), Image Fit (Scale to Fit), First DNG File (empty); '
        'no Sigma fp or Advanced group', hidden_defaults=hidden)
@@ -98,8 +99,8 @@ def main():
 
     # Clip Info rows: filled from the DNG when the source is known, the frame sizes after a render.
     host.changed('Source')
-    rows = {n: host.get(n) for n in ('info', 'infoExposure', 'infoFormat', 'infoLens', 'infoCorrection')}
-    assert rows['info'] == first.name and 'ISO ' in rows['infoExposure'] and ' fps' in rows['infoExposure'], rows
+    rows = {n: host.get(n) for n in ('info', 'infoExposure', 'infoFormat', 'infoLens', 'infoVignette', 'infoDistortion')}
+    assert rows['info'].startswith(first.name) and 'ISO ' in rows['infoExposure'] and ' fps' in rows['infoExposure'], rows
     assert '-bit | ' in rows['infoFormat'] and ' mm' in rows['infoLens'] and 'infoOutput' not in host.params(), rows
     ok('Clip Info rows', **rows)
 

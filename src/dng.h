@@ -67,7 +67,8 @@ bool decode_raw(const uint8_t* data, size_t size, const DngInfo& info, uint16_t*
 
 // Applies a shading map to info's decoded raw samples in place (black level kept, clipped samples left
 // clipped). The frame shows the middle fracW x fracH of what the map covers (1 = all of it).
-void apply_shading(const DngInfo& info, const GainMap& g, uint16_t* raw, double fracW, double fracH);
+// The samples are left at a finer scale: info's black and white levels are multiplied to match.
+void apply_shading(DngInfo& info, const GainMap& g, uint16_t* raw, double fracW, double fracH);
 
 bool read_file(const std::string& path, std::vector<uint8_t>& data, std::string& error);
 

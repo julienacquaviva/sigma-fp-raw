@@ -1,5 +1,20 @@
 # Sigma fp RAW: changes by version
 
+## New in 1.9.7
+
+- The vignette-corrected raw samples are kept at 16 times finer steps (black and white levels scaled with them). Rounded
+  to whole raw steps, dim surfaces showed green and magenta patches (each colour off by up to a few percent, in bands).
+- Rolling Shutter Correction renamed Rolling Shutter Fix; zoom Smoothness default 3.
+- Every failed render is written to <user cache folder>/SigmaFpRaw/log.txt and shown in the Clip line ("last problem").
+- Develop RAW off on the GPU: three planes are allocated instead of the fifteen buffers of a development.
+- Stabilisation switch first, Gyro Status under it; the status starts with the number of frames.
+- Lens Correction: Vignette Correction, Resolve Gamma, Vignette Status, Vignette Profile; Distortion Correction, Distortion Status,
+  Distortion Profile. The Correction line is gone. Resolve Gamma is Off and greyed out unless the vignette is corrected on
+  Resolve's own picture (Vignette Correction on, Develop RAW off), where it starts at Rec.709.
+
+- Vignette Correction with Develop RAW on applies the brightness of the lens profile only. The colour part of the camera's
+  map (red and blue against green) put green and magenta patches into frames that have no colour shading without it.
+
 ## New in 1.9.6
 
 - Develop RAW off: the host's frame is the timeline's frame with the clip placed in it by the host's input scaling. The

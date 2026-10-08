@@ -149,5 +149,7 @@ jobs:
             # The tag was moved to a newer commit: same release and notes, new files.
             gh release upload "$GITHUB_REF_NAME" out/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" out/* --title "Sigma fp RAW ${GITHUB_REF_NAME#v}" --notes-file packaging/RELEASE_NOTES.md
+            # A file packaging/PRERELEASE makes it a pre-release: published for testers, not the "latest" release.
+            PRE=""; [ -f packaging/PRERELEASE ] && PRE="--prerelease"
+            gh release create "$GITHUB_REF_NAME" out/* $PRE --title "Sigma fp RAW ${GITHUB_REF_NAME#v}" --notes-file packaging/RELEASE_NOTES.md
           fi

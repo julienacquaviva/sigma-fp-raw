@@ -74,8 +74,8 @@ machines for every change, but they have not yet been tried inside DaVinci Resol
 
 1. **Color page**: open *Effects*, find **Sigma fp RAW** in the *Sigma fp* group, and drop it on the **first node** of a Sigma fp CinemaDNG clip. Grade on the nodes after it.
 2. Choose who develops the picture, with **Develop RAW** in the *Camera RAW* group:
-   - **Off (the default)**: the picture and the colour are Resolve's own. Its Camera RAW settings (for example Blackmagic Design colour space and Blackmagic Design Film gamma), your colour management and your PowerGrades work as without the plug-in. The plug-in adds the Transform, the stabilisation and the lens corrections on that picture. If Resolve scales mismatched clips to fill the frame, set **Resolve Input Scaling** to *Fill*. For the Vignette Correction, set **Resolve Gamma** to the Gamma of Resolve's Camera RAW panel.
-   - **On**: the plug-in develops the original DNG frames itself, at full resolution, with its own Camera RAW controls, the Sigma fp 3K fixes and the colour shading correction; Resolve's Camera RAW settings then do nothing. Set *Project Settings > Camera RAW > CinemaDNG > Decode Quality* to **Quarter Res.** (Resolve's picture is not used, so the lowest quality only saves time). Unmanaged timeline: leave the plug-in at Rec.709 / Rec.709. DaVinci Wide Gamut timeline: *Color Space* **DaVinci Wide Gamut** and *Gamma* **DaVinci Intermediate**.
+   - **Off (the default)**: the picture and the colour are Resolve's own. Its Camera RAW settings (for example Blackmagic Design colour space and Blackmagic Design Film gamma), your colour management and your PowerGrades work as without the plug-in. The plug-in adds the Transform, the stabilisation and the lens corrections on that picture. If Resolve scales mismatched clips to fill the frame, set **Resolve Input Scaling** to *Fill*. For the Vignette Correction, set **Resolve Gamma** (under the Vignette Correction switch) to the Gamma of Resolve's Camera RAW panel.
+   - **On**: the plug-in develops the original DNG frames itself, at full resolution, with its own Camera RAW controls, and the Sigma fp 3K fixes; Resolve's Camera RAW settings then do nothing. Set *Project Settings > Camera RAW > CinemaDNG > Decode Quality* to **Quarter Res.** (Resolve's picture is not used, so the lowest quality only saves time). Unmanaged timeline: leave the plug-in at Rec.709 / Rec.709. DaVinci Wide Gamut timeline: *Color Space* **DaVinci Wide Gamut** and *Gamma* **DaVinci Intermediate**.
 
 *Clip Info* at the top of the panel shows the clip, shutter speed and angle, ISO, frame rate, aspect ratio, bit depth, the sensor window and the recorded resolution, the focal length and the crop against full frame.
 
@@ -87,7 +87,6 @@ machines for every change, but they have not yet been tried inside DaVinci Resol
 |---|---|
 | Develop RAW | Off (default): Resolve's own picture and colour are kept; the controls below do nothing. On: the plug-in develops the DNG frames with them. |
 | Resolve Input Scaling | Develop RAW off only: how Resolve places a clip of another shape than the timeline, *Scale to Fit* (its default) or *Fill*. Needed for the stabilisation and the lens corrections to line up. |
-| Resolve Gamma | Develop RAW off only, for the Vignette Correction: the Gamma of Resolve's Camera RAW panel (Linear, 2.2, 2.4, 2.6, Rec.709, sRGB, Blackmagic Design Film, 4K Film, 4.6K Film, DaVinci Intermediate, ACEScct) |
 | Decode Quality | *Full Res.* (RCD demosaic) or *Half Res.* (2×2 binned, fastest) |
 | White Balance | As Shot, Daylight, Cloudy, Shade, Tungsten, Fluorescent, Flash, Custom. Editing *Color Temp* or *Tint* switches to Custom. |
 | Color Space | Rec.709, P3 D65, Rec.2020, DaVinci Wide Gamut, ACES AP0, ACES AP1 |
@@ -117,10 +116,13 @@ result once more.
 
 | Control | What it does |
 |---|---|
-| Correction | Read-only: what each correction uses for this clip |
-| Vignette Correction | Removes the lens's vignette (with Develop RAW on, also its colour shading). Off by default. |
+| Vignette Correction | Removes the lens's vignette (its brightness falloff). Off by default. |
+| Resolve Gamma | Only with Develop RAW off: the Gamma of Resolve's Camera RAW panel, so that the vignette is removed in linear light. Starts at Rec.709; Off when not needed. |
+| Vignette Status | Read-only: what the correction uses for this clip |
+| Vignette Profile | Empty: the lens's own profile from the clip, and when the clip has none, the Adobe lens profile installed on the computer for that lens. Or a file to use instead: a DNG shot with the same lens, an Adobe lens profile (`.lcp`) or a Lensfun file (`.xml`). |
 | Distortion Correction | Straightens the lens's distortion, in the same single resampling as the Transform and the stabilisation. Off by default. |
-| Vignette Profile, Distortion Profile | Empty: the lens's own profile from the clip, and when the clip has none, the Adobe lens profile installed on the computer for that lens. Or a file to use instead: a DNG shot with the same lens, an Adobe lens profile (`.lcp`) or a Lensfun file (`.xml`). |
+| Distortion Status | Read-only: what the correction uses for this clip |
+| Distortion Profile | As Vignette Profile |
 
 The camera writes the lens's profile into every frame for lenses with electronic contacts; the vignette only when its
 *Vignetting* compensation is set to *Auto*. Fisheye profiles are not supported, and lateral chromatic aberration is not corrected.
@@ -129,10 +131,10 @@ The camera writes the lens's profile into every frame for lenses with electronic
 
 | Control | What it does |
 |---|---|
-| Gyro | Read-only status: the gyro data in use, or why stabilisation is off |
 | Stabilisation | Off by default; does nothing on clips without gyro data |
+| Gyro Status | Read-only: the gyro data in use, or why stabilisation is off |
 | Smoothness | Seconds of camera-path smoothing. 0 corrects the rolling shutter only; large values lock the shot. |
-| Rolling Shutter Correction | 0 to 1; 1 corrects every sensor row for the time it was read |
+| Rolling Shutter Fix | 0 to 1; 1 corrects every sensor row for the time it was read |
 | Rolling Shutter ms, Focal Length (mm) | Filled in from the clip; type a value to override it (needed for manual lenses) |
 | Sync Offset (ms) | Fine trim; normally 0 |
 | Range | The part of the clip that smoothing and zoom are worked out for: Whole Clip, Automatic, or Manual frame numbers |
@@ -150,7 +152,7 @@ How the sync, the rolling-shutter model and the zoom work, with measurements, is
 ## Limits
 
 - There is no noise reduction; use Resolve's.
-- With Develop RAW off, Resolve's picture at the timeline resolution is resampled once more (slightly softer than the plug-in's own development), and the colour shading and the 3K fixes are not applied.
+- With Develop RAW off, Resolve's picture at the timeline resolution is resampled once more (slightly softer than the plug-in's own development), and the 3K fixes are not applied.
 - Retimed clips and compound clips are not verified; frames map one to one to source frames.
 - The plug-in needs the clip's file path from Resolve, which it gets on the Color page. On the Fusion page it shows an error.
 - Gyro stabilisation uses a pinhole model: switch Distortion Correction on for wide lenses.

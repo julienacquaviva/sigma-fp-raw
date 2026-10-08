@@ -434,7 +434,7 @@ bool lens_vignette(const std::string& userFile, const DngInfo& clip, GainMap& ou
         return true;
     }
     out = GainMap{};
-    note = why + (clip.shading.valid() ? "none (camera Vignetting off, no Adobe profile for this lens): colour shading only" : "none");
+    note = why + (clip.shading.valid() ? "none (camera Vignetting off, no Adobe profile for this lens)" : "none");
     return false;
 }
 

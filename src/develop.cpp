@@ -61,6 +61,7 @@ struct Ctx {
     float lastDezig = -1;
     CUdeviceptr raw = 0, raw2 = 0, cfa = 0, vhb = 0, lpfb = 0, pqb = 0, R = 0, G = 0, B = 0;
     size_t cap = 0;
+    size_t planeCap = 0;         // R, G, B alone (the host's own picture needs no more)
     CUdeviceptr out = 0;
     size_t outCap = 0;
     // Demosaic reuse key.
@@ -445,15 +446,27 @@ bool Developer::develop(const Frame& f, const RawSettings& s, CUstream stream, c
     if (x->lastStream != stream && x->lastStream) cu.cuStreamSynchronize(x->lastStream);
     x->lastStream = stream;
     const size_t n = source ? static_cast<size_t>(dp.W) * dp.H : static_cast<size_t>(W) * H;
-    if (x->cap < n) {
+    if (source && x->cap < n) {
+        // The host's own picture: three planes are all it takes (a quarter of a gigabyte less
+        // GPU memory at UHD than the buffers of a development).
+        if (x->planeCap < n) {
+            for (CUdeviceptr* p : {&x->raw, &x->raw2, &x->cfa, &x->vhb, &x->lpfb, &x->pqb, &x->R, &x->G, &x->B, &x->T[0], &x->T[1], &x->T[2], &x->T[3], &x->T[4], &x->T[5]})
+                if (*p) { cu.cuMemFree(*p); *p = 0; }
+            x->cap = x->planeCap = 0;
+            x->valid = false;
+            for (CUdeviceptr* p : {&x->R, &x->G, &x->B})
+                if (!check(cu.cuMemAlloc(p, n * 4), "GPU memory", e)) return false;
+            x->planeCap = n;
+        }
+    } else if (x->cap < n) {
         for (CUdeviceptr* p : {&x->raw, &x->raw2, &x->cfa, &x->vhb, &x->lpfb, &x->pqb, &x->R, &x->G, &x->B, &x->T[0], &x->T[1], &x->T[2], &x->T[3], &x->T[4], &x->T[5]})
             if (*p) { cu.cuMemFree(*p); *p = 0; }
-        x->cap = 0;
+        x->cap = x->planeCap = 0;
         x->valid = false;
         if (!check(cu.cuMemAlloc(&x->raw, n * 2), "GPU memory", e) || !check(cu.cuMemAlloc(&x->raw2, n * 2), "GPU memory", e)) return false;
         for (CUdeviceptr* p : {&x->cfa, &x->vhb, &x->lpfb, &x->pqb, &x->R, &x->G, &x->B, &x->T[0], &x->T[1], &x->T[2], &x->T[3], &x->T[4], &x->T[5]})
             if (!check(cu.cuMemAlloc(p, n * 4), "GPU memory", e)) return false;
-        x->cap = n;
+        x->cap = x->planeCap = n;
     }
     auto t0 = std::chrono::steady_clock::now();
     const unsigned bx = 32, by = 8;

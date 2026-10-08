@@ -5,9 +5,11 @@
 // and edge anti-aliasing.
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +70,8 @@ const OfxMessageSuiteV1* gMsg1 = nullptr;
 // ---- parameter names ----
 const char* WB_OPTIONS[] = {"As Shot", "Daylight", "Cloudy", "Shade", "Tungsten", "Fluorescent", "Flash", "Custom"};
 const char* CS_OPTIONS[] = {"Rec.709", "P3 D65", "Rec.2020", "DaVinci Wide Gamut", "ACES AP0", "ACES AP1"};
+const char* SOURCE_GAMMAS[] = {"Linear", "Gamma 2.2", "Gamma 2.4", "Gamma 2.6", "Rec.709", "sRGB", "Blackmagic Design Film", "Blackmagic Design 4K Film",
+                               "Blackmagic Design 4.6K Film", "DaVinci Intermediate", "ACEScct", "Off"};
 const char* GAMMA_OPTIONS[] = {"Linear", "Gamma 2.2", "Gamma 2.4", "Rec.709", "sRGB", "DaVinci Intermediate", "ACEScct"};
 
 struct Instance {
@@ -95,9 +99,12 @@ struct Instance {
     // EXIF of the first frame (0 = unknown).
     double exposureS = 0, exifFocalMm = 0;
     int windowW = 0, windowH = 0;     // sensor window, from the first frame's gyro block (0 = none)
+    std::string lastProblem;          // the last error of a render (under rangeM), shown in the Clip line
     OfxPropertySetHandle zoomSmoothProps = nullptr;   // to grey Smoothness (zoom) out while Zoom Mode is Fixed
+    OfxPropertySetHandle sourceGammaProps = nullptr;  // to grey Resolve Gamma out while Develop RAW is on
 };
 
+OfxPropertySetHandle effect_props(OfxImageEffectHandle h);
 OfxPropertySetHandle effect_props(OfxImageEffectHandle h) {
     OfxPropertySetHandle p = nullptr;
     gEffect->getPropertySet(h, &p);
@@ -116,7 +123,34 @@ std::string get_s(OfxPropertySetHandle p, const char* n) {
     return gProp->propGetString(p, n, 0, &v) == kOfxStatOK && v ? v : "";
 }
 
+Instance* instance(OfxImageEffectHandle h);
+
+// A line in the plug-in's log: <user cache folder>/SigmaFpRaw/log.txt (%LOCALAPPDATA% on Windows,
+// ~/Library/Caches on a Mac). What the host's "could not be run successfully" does not say.
+void log_line(const std::string& text) {
+    static std::mutex m;
+    std::lock_guard<std::mutex> l(m);
+    const std::string base = os::user_cache_dir();
+    if (base.empty()) return;
+    os::make_dir(base + os::kSep + "SigmaFpRaw");
+    const std::string path = base + os::kSep + "SigmaFpRaw" + os::kSep + "log.txt";
+    os::FileInfo info;
+    const bool fresh = !os::stat_file(path, info) || info.size > 512 * 1024;   // starts again when it has grown large
+    if (FILE* f = std::fopen(path.c_str(), fresh ? "w" : "a")) {
+        char when[32] = "";
+        const std::time_t now = std::time(nullptr);
+        std::strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+        std::fprintf(f, "%s  v" SFP_VERSION "  %s%c", when, text.c_str(), 10);
+        std::fclose(f);
+    }
+}
+
 void post_error(OfxImageEffectHandle h, const std::string& text) {
+    log_line(text);
+    if (Instance* in = h ? instance(h) : nullptr) {
+        std::lock_guard<std::mutex> l(in->rangeM);
+        in->lastProblem = text;
+    }
     if (gMsg2) gMsg2->setPersistentMessage(h, kOfxMessageError, "sfp_error", "%s", text.c_str());
     else if (gMsg1) gMsg1->message(h, kOfxMessageError, "sfp_error", "%s", text.c_str());
 }
@@ -240,12 +274,7 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
              "On: the plug-in develops the original DNG frames itself, with the controls below. Off: the picture and the colour stay Resolve's own "
              "(its Camera RAW settings, your colour pipeline and PowerGrades as without the plug-in); the plug-in then only does the Transform, the "
              "stabilisation and the lens corrections on that picture. Off costs some sharpness (Resolve's picture at the timeline resolution is "
-             "resampled once more); the vignette correction then needs Resolve Gamma set, and the controls below it do nothing.");
-    const char* sg[] = {"Linear", "Gamma 2.2", "Gamma 2.4", "Gamma 2.6", "Rec.709", "sRGB", "Blackmagic Design Film", "Blackmagic Design 4K Film",
-                        "Blackmagic Design 4.6K Film", "DaVinci Intermediate", "ACEScct"};
-    d.choice("sourceGamma", "Resolve Gamma", sg, 11, 4, "raw",
-             "Develop RAW off only, for the Vignette Correction: the Gamma set in Resolve's own Camera RAW panel for this clip. The vignette is removed in "
-             "linear light, so the plug-in has to know how Resolve's picture is encoded. A wrong choice makes the corners too bright or too dark.");
+             "resampled once more), and the controls below do nothing.");
     const char* sc[] = {"Scale to Fit", "Fill"};
     d.choice("sourceScaling", "Resolve Input Scaling", sc, 2, 0, "raw",
              "Develop RAW off only: how Resolve places a clip that has another shape than the timeline (Project Settings > Image Scaling > Mismatched "
@@ -294,38 +323,49 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     d.choice("resampling", "Resampling", resamplers, 2, 0, nullptr, "The kernel of the single resampling: Best (Lanczos-3) or Fast (bilinear).");
     d.hide();
     d.group("lens", "Lens Correction", false,
-            "Corrections from the lens's own profile, which the camera writes into every frame. The Correction line says what the clip carries.");
-    d.label("infoCorrection", "Correction", "lens", "What each of the two corrections uses for this clip: the picked file, the lens's own profile from the camera, or the installed Adobe profile.");
-    d.toggle("lensShading", "Vignette Correction", false, "lens",
-             "Removes the lens's vignette and colour shading. The vignette is only in the frames when the camera's Vignetting compensation "
-             "was set to Auto. Applied to the raw data, before everything else.");
-    d.toggle("lensDistortion", "Distortion Correction", false, "lens",
-             "Straightens the lens's distortion, in the same single resampling as the fit, the Transform and the stabilisation "
-             "(which then works on the straightened picture).");
+            "Vignette and distortion correction from the lens's own profile, which the camera writes into every frame, or from a profile file.");
     const char* fileHint = "Leave empty: the lens's own profile from the clip is used, and when the clip has none, the Adobe lens profile installed on "
                            "this computer for that lens. Or pick a profile file to use instead: a DNG shot with the same lens (a clip frame or a still), "
-                           "an Adobe lens profile (.lcp) or a Lensfun file (.xml). The Correction line says what is used.";
-    for (const char* const* f : {(const char* const[]){"lensShadingFile", "Vignette Profile"}, (const char* const[]){"lensDistortionFile", "Distortion Profile"}}) {
-        auto p = d.define(kOfxParamTypeString, f[0], f[1], fileHint, "lens");
+                           "an Adobe lens profile (.lcp) or a Lensfun file (.xml). The Status line says what is used.";
+    auto profile = [&](const char* name, const char* label) {
+        auto p = d.define(kOfxParamTypeString, name, label, fileHint, "lens");
         set_s(p, kOfxParamPropStringMode, kOfxParamStringIsFilePath);
         set_s(p, kOfxParamPropDefault, "");
         set_i(p, kOfxParamPropAnimates, 0);
-    }
+    };
+    d.toggle("lensShading", "Vignette Correction", false, "lens",
+             "Removes the lens's vignette (its brightness falloff). The vignette is only in the frames when the camera's Vignetting compensation "
+             "was set to Auto. Applied to the raw data, before everything else.");
+    // Off comes after the curves so that those keep the numbers projects have stored.
+    d.choice("sourceGamma", "Resolve Gamma", SOURCE_GAMMAS, 12, 11, "lens",
+             "With Develop RAW off, the vignette is removed from Resolve's own picture, in linear light: set this to the Gamma of Resolve's Camera RAW "
+             "panel (Rec.709 to start with). A wrong one makes the corners too bright or too dark. Off and greyed out while Vignette Correction is off, "
+             "or while Develop RAW is on (the plug-in then makes the picture itself).");
+    // Hidden: the curve last in use, to come back to when Resolve Gamma comes into use again.
+    d.choice("sourceGammaKept", "Resolve Gamma (kept)", SOURCE_GAMMAS, 11, 4, "lens", "");
+    d.hide();
+    d.label("infoVignette", "Vignette Status", "lens", "What the Vignette Correction uses for this clip: the picked file, the lens's own profile from the camera, or the installed Adobe profile.");
+    profile("lensShadingFile", "Vignette Profile");
+    d.toggle("lensDistortion", "Distortion Correction", false, "lens",
+             "Straightens the lens's distortion, in the same single resampling as the fit, the Transform and the stabilisation "
+             "(which then works on the straightened picture).");
+    d.label("infoDistortion", "Distortion Status", "lens", "What the Distortion Correction uses for this clip: the picked file, the lens's own profile from the camera, or the installed Adobe profile.");
+    profile("lensDistortionFile", "Distortion Profile");
     d.group("stab", "Stabilisation (gyro)", false,
             "Gyro stabilisation from the camera's gyro data: inside the DNG frames, or the <clip>.FPG file next to them. Found automatically; without gyro data this group does nothing.");
-    d.label("stabStatus", "Gyro", "stab", "Gyro data in use (frames, sample rate, focal length, zoom), loading progress, or why stabilisation is off. Refreshes when a control is changed.");
     d.toggle("stabEnable", "Stabilisation", false, "stab", "Stabilise with the camera's gyro data (inside the DNG frames, or an .FPG file). Off by default.");
+    d.label("stabStatus", "Gyro Status", "stab", "Gyro data in use (frames, sample rate, focal length, zoom), loading progress, or why stabilisation is off. Refreshes when a control is changed.");
     d.number("stabSmoothness", "Smoothness", 0.1, 0, 30, 0, 3, "stab",
              "Time constant in seconds of the camera-path smoothing. 0 follows the camera (rolling-shutter correction only); large values lock the shot. More smoothing needs more zoom.");
-    d.number("stabRollingShutter", "Rolling Shutter Correction", 1, 0, 1, 0, 1, "stab",
+    d.number("stabRollingShutter", "Rolling Shutter Fix", 1, 0, 1, 0, 1, "stab",
              "1 corrects each sensor row for the time it was read; 0 treats the frame as one instant.");
     d.number("stabReadout", "Rolling Shutter ms", 0, 0, 500, 0, 50, "stab",
              "Readout time of the sensor rows, first to last, in milliseconds. Filled in from the clip's gyro data; change it to override "
-             "(the Gyro line then says override). 0 or reset = the clip's value again.", 2);
+             "(the Gyro Status line then says override). 0 or reset = the clip's value again.", 2);
     d.number("stabSync", "Sync Offset (ms)", 0, -500, 500, -50, 50, "stab",
              "Added to the file's mark delay. Positive values use earlier gyro data for each frame. Normally 0.", 1);
     d.number("stabFocal", "Focal Length (mm)", 0, 0, 5000, 0, 200, "stab",
-             "Filled in from the clip's gyro data; change it to override (the Gyro line then says override), for manual lenses or to trim the "
+             "Filled in from the clip's gyro data; change it to override (the Gyro Status line then says override), for manual lenses or to trim the "
              "image scale. 0 or reset = the clip's value again.", 1);
     // Whether the two fields above show the clip's own value (kept up to date) or a value the user entered (never touched).
     d.toggle("stabFocalAuto", "Focal Length From Clip", true, "stab", "");
@@ -335,14 +375,14 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     d.toggle("stabAutoZoom", "Auto Zoom", true, "stab", "Zoom in by the smallest amount that hides the borders on every frame of the clip.");
     const char* ranges[] = {"Whole Clip", "Automatic", "Manual"};
     d.choice("stabRange", "Range", ranges, 3, 1, "stab",
-             "The part of the clip that smoothing and zoom are worked out for. Automatic: the part this timeline clip uses, when the host reports it (the Gyro line shows what it got). "
+             "The part of the clip that smoothing and zoom are worked out for. Automatic: the part this timeline clip uses, when the host reports it (the Gyro Status line shows what it got). "
              "Manual: the frames below. A shaky section outside the range no longer costs zoom inside it.");
     d.number("stabRangeStart", "Range Start (frame)", 1, 1, 10000000, 1, 10000, "stab", "Manual range: first source frame (the number in the DNG file name).", 0);
     d.number("stabRangeEnd", "Range End (frame)", 0, 0, 10000000, 0, 10000, "stab", "Manual range: last source frame (the number in the DNG file name); 0 = to the end of the clip.", 0);
     const char* zmodes[] = {"Fixed", "Dynamic"};
     d.choice("stabZoomMode", "Zoom Mode", zmodes, 2, 1, "stab",
              "Fixed: one zoom for the whole range. Dynamic: the zoom follows what each part needs and changes slowly, so a shaky section costs zoom only near itself.");
-    d.number("stabZoomSmooth", "Smoothness", 4, 0.2, 30, 0.5, 10, "stab",
+    d.number("stabZoomSmooth", "Smoothness", 3, 0.2, 30, 0.5, 10, "stab",
              "Zoom Mode Dynamic only (greyed out otherwise). Seconds over which the dynamic zoom looks ahead and eases. Larger = slower zoom changes, but more zoom around a shaky section.", 1);
     d.number("stabMaxZoom", "Auto Zoom Limit", 1.3, 1, 4, 1, 2, "stab",
              "Largest automatic zoom. Frames that would need more (violent moves) are stabilised less instead, so one jolt does not zoom the whole clip.", 2);
@@ -565,7 +605,7 @@ std::string ratio_name(int w, int h) {
 // The rows of the Clip Info block below the first (outside render). clip and warp: the gyro
 // data of the clip and the warp of the current frame, as gyro_for_frame gave them.
 void sync_info(Instance& in, double t, const std::shared_ptr<const GyroClip>& clip, const StabParams& warp) {
-    std::string exposure = "-", format = "-", lens = "-", correction = "-";
+    std::string exposure = "-", format = "-", lens = "-", vignette = "-", distortion = "-";
     char buf[512];
     if (in.haveMeta) {
         const DngInfo& m = in.meta;
@@ -624,22 +664,45 @@ void sync_info(Instance& in, double t, const std::shared_ptr<const GyroClip>& cl
         GainMap map;
         LensWarp warp;
         bool ownColour = true;
-        if (!ival(in, "lensShading", t)) correction = "vignette: off";
-        else {
-            const bool have = lens_vignette(sval(in, "lensShadingFile"), m, map, ownColour, note);
-            correction = "vignette: " + note;
-            if (have && !ival(in, "developRaw", t)) correction += " (brightness only, on Resolve's picture)";
-        }
-        if (!ival(in, "lensDistortion", t)) correction += " | distortion: off";
-        else { lens_distortion(sval(in, "lensDistortionFile"), m, warp, note); correction += " | distortion: " + note; }
+        if (ival(in, "lensShading", t)) { lens_vignette(sval(in, "lensShadingFile"), m, map, ownColour, note); vignette = note; }
+        if (ival(in, "lensDistortion", t)) { lens_distortion(sval(in, "lensDistortionFile"), m, warp, note); distortion = note; }
     }
-    const char* rows[4] = {"infoExposure", "infoFormat", "infoLens", "infoCorrection"};
-    const std::string* text[4] = {&exposure, &format, &lens, &correction};
+    if (in.haveMeta) {
+        // The Clip line: the file, and the last render that failed, in words (the host only says that one did).
+        std::string clipLine = in.metaPath.substr(in.metaPath.find_last_of("/\\") + 1), problem;
+        {
+            std::lock_guard<std::mutex> l(in.rangeM);
+            problem = in.lastProblem;
+        }
+        if (!problem.empty()) clipLine += " | last problem: " + problem;
+        if (sval(in, "info") != clipLine) {
+            const bool was = in.updating;
+            in.updating = true;
+            gParam->paramSetValue(in.params.at("info"), clipLine.c_str());
+            in.updating = was;
+        }
+    }
+    const char* rows[5] = {"infoExposure", "infoFormat", "infoLens", "infoVignette", "infoDistortion"};
+    const std::string* text[5] = {&exposure, &format, &lens, &vignette, &distortion};
     const bool was = in.updating;
     in.updating = true;
-    for (int k = 0; k < 4; ++k)
+    for (int k = 0; k < 5; ++k)
         if (sval(in, rows[k]) != *text[k]) gParam->paramSetValue(in.params.at(rows[k]), text[k]->c_str());
     in.updating = was;
+}
+
+// The Gyro Status line as shown: the status without its "On | gyro: " / "Off (switched off) | name: "
+// start, so that it begins with the number of frames (the switch above says whether it is on).
+// A reason other than the switch is kept, at the end.
+std::string gyro_display(const std::string& s) {
+    const bool on = s.compare(0, 5, "On | ") == 0, off = s.compare(0, 5, "Off (") == 0;
+    const size_t bar = s.find(" | ");
+    if ((!on && !off) || bar == std::string::npos) return s;
+    std::string rest = s.substr(bar + 3);
+    const size_t colon = rest.find(": ");
+    if (colon != std::string::npos && colon + 2 < rest.size() && std::isdigit(static_cast<unsigned char>(rest[colon + 2]))) rest = rest.substr(colon + 2);
+    const std::string why = off ? s.substr(5, bar - 6) : std::string();
+    return why.empty() || why == "switched off" ? rest : rest + " | not stabilised: " + why;
 }
 
 // Shows which gyro file the clip uses, or why stabilisation is off (outside render).
@@ -685,13 +748,26 @@ void sync_stab_status(Instance& in, double t) {
     in.stabStatus = status;
     const bool was = in.updating;
     in.updating = true;
-    gParam->paramSetValue(in.params.at("stabStatus"), status.c_str());
+    gParam->paramSetValue(in.params.at("stabStatus"), gyro_display(status).c_str());
     in.updating = was;
 }
 
 // Smoothness (of the zoom) only acts with Zoom Mode Dynamic: greyed out otherwise.
 void sync_enabled(Instance& in, double t) {
     if (in.zoomSmoothProps) set_i(in.zoomSmoothProps, kOfxParamPropEnabled, ival(in, "stabZoomMode", t) == 1 ? 1 : 0);
+    // Resolve Gamma is only used for the Vignette Correction on Resolve's own picture.
+    const bool gammaUsed = ival(in, "lensShading", t) && !ival(in, "developRaw", t);
+    if (in.sourceGammaProps) set_i(in.sourceGammaProps, kOfxParamPropEnabled, gammaUsed ? 1 : 0);
+    const int gamma = ival(in, "sourceGamma", t);
+    // Off when not used; back to the curve last in use (Rec.709 to start with) when it comes into use.
+    const bool was = in.updating;
+    in.updating = true;
+    if (gammaUsed && gamma < 11) {
+        if (ival(in, "sourceGammaKept", t) != gamma) gParam->paramSetValue(in.params.at("sourceGammaKept"), gamma);
+    } else if (gammaUsed ? gamma >= 11 : gamma != 11) {
+        gParam->paramSetValue(in.params.at("sourceGamma"), gammaUsed ? std::clamp(ival(in, "sourceGammaKept", t), 0, 10) : 11);
+    }
+    in.updating = was;
 }
 
 void set_temp_tint(Instance& in, double temp, double tint) {
@@ -715,12 +791,13 @@ OfxStatus create_instance(OfxImageEffectHandle h) {
                           "stabRollingShutter", "stabSync", "stabFocal", "stabAutoZoom", "stabMaxZoom", "stabZoom", "gyroFile", "stabRange", "stabRangeStart", "stabRangeEnd",
                           "stabZoomMode", "stabZoomSmooth", "stabReadout", "stabFocalAuto", "stabReadoutAuto", "fitMode", "xfZoomX", "xfZoomY",
                           "xfZoomLink", "xfPosX", "xfPosY", "xfRotation", "xfAnchorX", "xfAnchorY", "xfPitch", "xfYaw", "xfFlipH", "xfFlipV", "resampling",
-                          "infoExposure", "infoFormat", "infoLens", "infoCorrection", "lensShading", "lensDistortion", "lensShadingFile", "lensDistortionFile", "developRaw", "sourceGamma", "sourceScaling"}) {
+                          "infoExposure", "infoFormat", "infoLens", "infoVignette", "infoDistortion", "sourceGammaKept", "lensShading", "lensDistortion", "lensShadingFile", "lensDistortionFile", "developRaw", "sourceGamma", "sourceScaling"}) {
         OfxParamHandle p = nullptr;
         OfxPropertySetHandle pp = nullptr;
         if (gParam->paramGetHandle(ps, n, &p, &pp) != kOfxStatOK) return kOfxStatFailed;
         in->params[n] = p;
         if (!std::strcmp(n, "stabZoomSmooth")) in->zoomSmoothProps = pp;
+        if (!std::strcmp(n, "sourceGamma")) in->sourceGammaProps = pp;
     }
     Instance* raw = in.release();
     gProp->propSetPointer(effect_props(h), kOfxPropInstanceData, 0, raw);
@@ -782,7 +859,11 @@ OfxStatus instance_changed(OfxImageEffectHandle h, OfxPropertySetHandle args) {
             in->updating = false;
         }
         sync_stab_status(*in, t);   // the crop factor in Clip Info
-    } else if (name == "fitMode" || name == "developRaw" || name == "sourceGamma" || name.compare(0, 4, "lens") == 0) {
+    } else if (name == "developRaw") {
+        sync_enabled(*in, t);
+        sync_stab_status(*in, t);
+    } else if (name == "fitMode" || name == "sourceGamma" || name.compare(0, 4, "lens") == 0) {
+        if (name == "lensShading" || name == "sourceGamma") sync_enabled(*in, t);
         sync_stab_status(*in, t);
     } else if (name == "gyroFile" || name.compare(0, 4, "stab") == 0) {
         // A value typed into Focal Length or Rolling Shutter ms is the user's from now on; 0 (or
@@ -938,6 +1019,7 @@ OfxStatus render(OfxImageEffectHandle h, OfxPropertySetHandle args) {
         bool ownColour = true;
         if (!lens_vignette(sval(*in, "lensShadingFile"), frame->info, s.sourceVignette, ownColour, note)) s.sourceVignette = GainMap{};
         s.sourceGamma = ival(*in, "sourceGamma", time);
+        if (s.sourceGamma >= 11) s.sourceVignette = GainMap{};   // Off: Resolve's picture is not corrected
     }
     {
         std::string why;

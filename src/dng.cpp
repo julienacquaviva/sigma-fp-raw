@@ -73,8 +73,14 @@ bool read_ifd(const Reader& r, size_t off, std::vector<Entry>& out) {
 
 }  // namespace
 
-void apply_shading(const DngInfo& info, const GainMap& g, uint16_t* raw, double fracW, double fracH) {
+void apply_shading(DngInfo& info, const GainMap& g, uint16_t* raw, double fracW, double fracH) {
     if (!g.valid()) return;
+    // The result is kept at a finer scale than the camera's raw steps: all samples, black and
+    // white levels times `fine` (16 for 12-bit data). Rounded back to whole raw steps, a dim
+    // surface of 10 to 40 steps would be off by up to a few percent, differently for each
+    // colour and in bands that follow the gain: green and magenta patches (seen 2026-10-08).
+    int fine = 1;
+    while (fine < 16 && info.white * (fine * 2) <= 65535.f) fine *= 2;
     const int W = info.width, H = info.height;
     const int ax = info.activeLeft + info.cropX, ay = info.activeTop + info.cropY;
     fracW = std::clamp(fracW, 0.05, 1.0);
@@ -89,6 +95,7 @@ void apply_shading(const DngInfo& info, const GainMap& g, uint16_t* raw, double 
         fb[x] = static_cast<float>(m - j0[x]);
     }
     const int white = static_cast<int>(info.white);
+    const float top = info.white * fine;
     std::vector<float> row[2];
     for (int y = 0; y < H; ++y) {
         const double v = std::clamp((y - ay + 0.5) / info.cropH, 0.0, 1.0);
@@ -109,14 +116,16 @@ void apply_shading(const DngInfo& info, const GainMap& g, uint16_t* raw, double 
         uint16_t* px = raw + static_cast<size_t>(y) * W;
         for (int x = 0; x < W; ++x) {
             const int c = px[x];
-            if (c >= white) continue;
+            if (c >= white) { px[x] = static_cast<uint16_t>(top); continue; }   // clipped stays clipped
             const int par = x & 1;
             const float* r = row[par].data() + j0[x];
             const float gain = r[0] + fb[x] * (r[1] - r[0]);
-            const float out = black[par] + (c - black[par]) * gain + 0.5f;
-            px[x] = static_cast<uint16_t>(out < 0.f ? 0.f : out > 65535.f ? 65535.f : out);
+            const float out = (black[par] + (c - black[par]) * gain) * fine + 0.5f;
+            px[x] = static_cast<uint16_t>(out < 0.f ? 0.f : out > top ? top : out);
         }
     }
+    for (int k = 0; k < 4; ++k) info.black[k] *= fine;
+    info.white *= fine;
 }
 
 bool read_file(const std::string& path, std::vector<uint8_t>& data, std::string& error) {

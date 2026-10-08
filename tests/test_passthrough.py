@@ -69,7 +69,28 @@ def main():
     host.obj(host.obj(host.instance)['props'])['values']['OfxImageEffectPropSrcFilePath'] = [str(dng)]
     host.changed('Source')
     assert host.get('developRaw') == 0 and host.get('stabEnable') == 0 and (host.get('lensShading'), host.get('lensDistortion')) == (0, 0)
-    host.set(developRaw=1)
+    # Resolve Gamma (Lens Correction, under the Vignette Correction switch): only in use for the vignette on Resolve's own
+    # picture. Off and greyed out otherwise; Rec.709 to start with when it comes into use.
+    gprops = host.obj(host.obj(host.params()['sourceGamma'])['props'])['values']
+    assert host.get('sourceGamma') == 11 and host.choices('sourceGamma')[4] == 'Rec.709' and host.choices('sourceGamma')[11:] == ['Off'] and gprops.get('OfxParamPropParent') == ['lens']
+    host.set(lensShading=1); host.changed('lensShading')
+    assert host.get('sourceGamma') == 4 and gprops.get('OfxParamPropEnabled') == [1]
+    host.set(sourceGamma=6); host.changed('sourceGamma')                 # a choice made by hand stays
+    host.set(lensDistortion=1); host.changed('lensDistortion')
+    assert host.get('sourceGamma') == 6
+    host.set(lensDistortion=0); host.changed('lensDistortion')
+    host.set(developRaw=1); host.changed('developRaw')
+    assert host.get('sourceGamma') == 11 and gprops.get('OfxParamPropEnabled') == [0]
+    host.set(developRaw=0); host.changed('developRaw')
+    assert host.get('sourceGamma') == 6 and gprops.get('OfxParamPropEnabled') == [1]      # the curve picked before comes back
+    host.set(lensShading=0); host.changed('lensShading')
+    assert host.get('sourceGamma') == 11
+    host.set(lensShading=1); host.changed('lensShading')
+    assert host.get('sourceGamma') == 6
+    host.set(sourceGamma=4); host.changed('sourceGamma')
+    host.set(lensShading=0); host.changed('lensShading')
+    assert host.get('sourceGamma') == 11 and gprops.get('OfxParamPropEnabled') == [0] and host.get('infoVignette') == '-' and host.get('infoDistortion') == '-'
+    host.set(developRaw=1); host.changed('developRaw')
     keep = give_source(host, img)
 
     # Developing on: the source picture is not asked for, and the output is the developed frame.
@@ -80,6 +101,7 @@ def main():
 
     # Develop RAW off, everything neutral: the host's picture comes out bit for bit.
     host.set(developRaw=0, lensDistortion=0)
+    host.changed('developRaw')
     status, out = host.render(source_frame=0)
     assert status == OK, host.messages[-2:]
     got = out.pixels[::-1]
@@ -119,7 +141,7 @@ def main():
                   f'<calibration><distortion model="poly3" focal="28" k1="{k1}"/></calibration></lens></lensdatabase>')
     host.set(lensDistortion=1, lensDistortionFile=str(lf))
     host.changed('lensDistortionFile')
-    assert 'distortion: file, Lensfun' in host.get('infoCorrection') and 'vignette: off' in host.get('infoCorrection'), host.get('infoCorrection')
+    assert host.get('infoDistortion').startswith('file, Lensfun') and host.get('infoVignette') == '-', (host.get('infoDistortion'), host.get('infoVignette'))
     status, d = host.render(source_frame=0)
     dist = d.pixels[::-1][..., :3]
     radius = 12.0 / (35.9 / 6000) * (pw / 6048.0)          # 12 mm in sensor pixels, then in picture pixels (the frame shows the whole sensor width)
@@ -145,8 +167,8 @@ def main():
     vf.write_text(f'<lensdatabase version="1"><lens><maker>T</maker><model>Test 28mm F2</model><cropfactor>1</cropfactor><calibration>'
                   f'<vignetting model="pa" focal="28" aperture="2" distance="10" k1="{kv[0]}" k2="{kv[1]}" k3="{kv[2]}"/></calibration></lens></lensdatabase>')
     host.set(lensShading=1, lensShadingFile=str(vf))
-    host.changed('lensShadingFile')
-    assert "brightness only, on Resolve's picture" in host.get('infoCorrection'), host.get('infoCorrection')
+    host.changed('lensShading')
+    assert host.get('infoVignette').startswith('file, Lensfun') and 'Resolve Gamma' not in host.get('infoVignette'), host.get('infoVignette')
     yy, xx = np.mgrid[0:H, 0:W]
     mm = (35.9 / 6000) * (6048.0 / pw)                    # millimetres on the sensor per picture pixel
     r2 = (((xx + 0.5 - W / 2) * mm) ** 2 + ((yy + 0.5 - H / 2) * mm) ** 2) / (0.5 * np.hypot(36.0, 24.0)) ** 2
@@ -207,7 +229,7 @@ def main():
         fpg = TG.write_fpg(SCRATCH / 'syn.FPG', g, 20, raster=(cw + 16, ch + 12), active=(8, 6, cw, ch))
         host.set(stabEnable=1, stabSmoothness=0.5, stabZoomMode=0, gyroFile=str(fpg))
         host.changed('gyroFile')
-        assert host.get('stabStatus').startswith('On'), host.get('stabStatus')
+        assert host.get('stabStatus')[0].isdigit(), host.get('stabStatus')
         status, st = host.render(source_frame=0)
         assert status == OK, host.messages[-2:]
         stab = st.pixels[::-1][..., :3]

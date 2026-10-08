@@ -608,18 +608,18 @@ def background_status(ok):
     seen = wait_ready(host)
     percents = [int(s.split()[2]) for s in seen if s.startswith('Loading')]
     assert percents == sorted(percents) and percents[-1] > 0, seen
-    assert seen[-1].startswith('On | gyro: 292 frames, in-frame, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2520 px, zoom 1.300'), seen[-1]
+    assert seen[-1].startswith('292 frames, in-frame, 2499.46 Hz, readout 24.8 ms, 28.0 mm = 2520 px, zoom 1.300'), seen[-1]
     assert (host.get('stabFocal'), host.get('stabReadout')) == (28.0, 24.8)        # prefilled once the data is there
     host.set(stabEnable=0)
     host.changed('stabEnable')
-    assert host.get('stabStatus').startswith('Off (switched off) | gyro: 292 frames, in-frame')
+    assert host.get('stabStatus').startswith('292 frames, in-frame')
     host.close()
     os.environ.pop('SFP_GYRO_SCAN_DELAY_US')
     # Second instance on the same clip in the same session after an unload: scanned again, at once without the delay.
     host = OFXHost(PLUGIN, canvas=(1620, 1080))
     host.set(**STAB_TEST)
     source(host, first)
-    assert host.get('stabStatus').startswith('On | gyro: 292 frames, in-frame'), host.get('stabStatus')
+    assert host.get('stabStatus').startswith('292 frames, in-frame'), host.get('stabStatus')
     host.close()
     ok('plug-in: status shows "Loading gyro N %" while the scan runs in the background, then the in-frame line',
        host_blocked_s=took, percent_seen=percents, final=seen[-1])
