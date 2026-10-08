@@ -450,6 +450,12 @@ static int selftest(const char* fpg) {
             const bool same = worst < 0.02 && sum / gpu.size() < 2e-4 && nonFinite == 0;
             std::printf("%s vs CPU, %s: largest difference %.6f, mean %.7f, non-finite %d, %.1f ms (CPU %.1f ms)%s\n", backend.c_str(), names[c], worst,
                         sum / gpu.size(), nonFinite, gpuMs, cpuMs, same ? "" : "  <-- DIFFERENT");
+            {
+                char line[300];
+                std::snprintf(line, sizeof line, "%s vs CPU, %s: largest difference %.6f, mean %.7f, %.1f ms (CPU %.1f ms)", backend.c_str(), names[c], worst,
+                              sum / gpu.size(), gpuMs, cpuMs);
+                annotate("notice", line);
+            }
             if (!same) {
                 ok = false;
                 char buf[300];
