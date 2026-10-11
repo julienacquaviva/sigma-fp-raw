@@ -1,10 +1,11 @@
-## What's new (pre-release, for testing)
+## What's new
 
-- **Fix: Vignette Correction with Develop RAW on put faint green and magenta patches into dim areas.**
-- **"Sigma fp RAW could not be run successfully": the plug-in now says why.** The reason is written to `SigmaFpRaw/log.txt` in the user's local app-data folder (`%LOCALAPPDATA%` on Windows, `~/Library/Caches` on a Mac), and shown in the Clip line of Clip Info after any control is changed.
-- With Develop RAW off the plug-in uses much less GPU memory.
-- Lens Correction is laid out as two blocks: Vignette Correction with Resolve Gamma, Vignette Status and Vignette Profile; Distortion Correction with Distortion Status and Distortion Profile. Resolve Gamma is Off until it is needed and then starts at Rec.709.
-- Stabilisation: the tick comes first, Gyro Status underneath; Rolling Shutter Correction is now Rolling Shutter Fix; the zoom Smoothness starts at 3.
+- **Camera Matrix: Chart-Fitted (daylight)**, a new choice in Camera RAW (Develop RAW on): a ColorChecker fit of the fp's sensor in place of the file's own matrices, with the same white balance. *As Recorded* stays the default. Contributed by lukaDen.
+- **ARRI Wide Gamut 3** as an output Color Space. Contributed by lukaDen.
+- **Linux: the plug-in no longer shows "Failed to load" in Resolve.** Contributed by jedypod.
+- Vignette Correction with Develop RAW on no longer puts faint green and magenta patches into dim areas.
+- When Resolve says "Sigma fp RAW could not be run successfully", the reason is now written to `SigmaFpRaw/log.txt` in the user's local app-data folder (`%LOCALAPPDATA%` on Windows, `~/Library/Caches` on a Mac) and shown in the Clip line of Clip Info.
+- Lens Correction and Stabilisation are laid out with their own status lines; less GPU memory is used with Develop RAW off.
 
 ## Downloads
 

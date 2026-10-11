@@ -43,6 +43,7 @@ def main():
     assert raw_controls <= params, raw_controls - params
     assert {'rowPhase', 'deZigzag', 'fit'} <= params and not {'rowPhaseMode', 'deZigzagMode'} & params
     assert host.choices('whiteBalance') == ['As Shot', 'Daylight', 'Cloudy', 'Shade', 'Tungsten', 'Fluorescent', 'Flash', 'Custom']
+    assert host.choices('cameraMatrix') == ['As Recorded', 'Chart-Fitted (daylight)'] and host.get('cameraMatrix') == 0 and host.choices('colorSpace')[6] == 'ARRI Wide Gamut 3'
     ok('load, describe, instance; Camera RAW + Sigma fp controls declared', controls=len(params))
 
     # Controls taken out of the panel in v1.3: still parameters (old projects load), hidden, at their defaults.
@@ -74,7 +75,7 @@ def main():
     assert (host.get('lensShading'), host.get('lensDistortion')) == (0, 0)
     host.set(lensShading=1, lensDistortion=1)                 # as the reference of the tests below (the command-line tool's defaults)
     shown = sorted(n for n in params if not prop(n, 'OfxParamPropSecret') and prop(n, 'OfxParamPropParent') == 'raw')
-    assert 'highlightRecovery' not in shown and 'exposure' in shown and 'developRaw' in shown and 'sourceScaling' in shown and len(shown) == 18, shown
+    assert 'highlightRecovery' not in shown and 'exposure' in shown and 'developRaw' in shown and 'sourceScaling' in shown and 'cameraMatrix' in shown and len(shown) == 19, shown
     ok('hidden: Highlight Recovery, Gamut Mapping, Pre Tone Curve, Soft Clip (all off), Frame Mapping (Resolve Source Frame), '
        'Timeline Anchor (0), Row Phase (-0.125), Edge Anti-aliasing (80), Image Fit (Scale to Fit), First DNG File (empty); '
        'no Sigma fp or Advanced group', hidden_defaults=hidden)

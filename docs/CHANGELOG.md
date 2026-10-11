@@ -1,5 +1,13 @@
 # Sigma fp RAW: changes by version
 
+## New in 1.9.8
+
+- Camera Matrix choice (As Recorded / Chart-Fitted (daylight), src/fp_chart_matrix.h) and ARRI Wide Gamut 3 output
+  primaries: pull request 1, lukaDen.
+- Linux: the plug-in is linked with -z nodelete, so that Resolve's OFXLoader probe (dlopen, dlclose, exit) does not crash and
+  mark it as failed: pull request 2, jedypod.
+- 1.9.7 was a pre-release; its changes are part of this release.
+
 ## New in 1.9.7
 
 - The vignette-corrected raw samples are kept at 16 times finer steps (black and white levels scaled with them). Rounded
