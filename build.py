@@ -65,6 +65,11 @@ def zig_build(zig, target, cpu, sources, out, shared):
         cmd += ['-ldl', '-lpthread', '-s']
     if shared:
         cmd.append('-shared')
+        if 'linux' in target:
+            # zig's library has no crtbegin, so dlclose does not run __cxa_finalize: the destructors of the
+            # library's C++ statics would stay registered with exit() after the library is unmapped, and
+            # Resolve's OFXLoader probe (dlopen, dlclose, exit) segfaults and marks the plug-in as failed.
+            cmd += ['-Wl,-z,nodelete']
     out.parent.mkdir(parents=True, exist_ok=True)
     run([*cmd, *sources, '-o', out])
     for junk in out.parent.glob('*'):   # the Windows linker leaves an import library and debug data
