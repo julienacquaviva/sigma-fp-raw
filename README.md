@@ -98,8 +98,10 @@ machines for every change, but they have not yet been tried inside DaVinci Resol
 
 In Color Mode OFF the fp writes a Rec.709 stand-in into ColorMatrix1/2, not a sensor calibration, so
 OFF clips decode at about half chroma; the colour modes carry Sigma's calibration. *Chart-Fitted* swaps in
-a ColorChecker fit of the fp sensor and keeps the camera neutral the file's own matrices give, so White
-Balance, Temp and Tint read exactly as before. Measured through this plug-in (`sfp_cli develop`, Rec.709
+a ColorChecker fit of the fp sensor and keeps the camera neutral the file's own matrices give at the two
+calibration whites (Standard A and D65). With White Balance *As Shot* the balance is therefore unchanged. With a
+preset or a *Custom* temperature between those whites it shifts (checked on the OFF matrices: red gain about +3.5 %,
+blue gain up to about +16 % around 4000 to 4500 K), so set Temp again after switching. Measured by the contributor through this plug-in (`sfp_cli develop`, Rec.709
 linear, ColorChecker 24, CIEDE2000 mean of the 18 colour patches, white balance as shot):
 
 | Clip | As Recorded | Chart-Fitted |

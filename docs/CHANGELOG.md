@@ -7,6 +7,11 @@
 - Linux: the plug-in is linked with -z nodelete, so that Resolve's OFXLoader probe (dlopen, dlclose, exit) does not crash and
   mark it as failed: pull request 2, jedypod.
 - 1.9.7 was a pre-release; its changes are part of this release.
+- Checked independently (2026-10-11): each chart slot maps its white to 1,1,1; the StdA slot is the D65 slot Bradford-adapted
+  (1.5e-9); the to-Rec.709 matrix follows from the D65 slot (3.5e-4); ARRI Wide Gamut 3 gives ARRI's published X and Y rows.
+  White balance: identical with As Shot; with a chosen temperature between the calibration whites the gains differ from
+  the recorded pair (blue up to +16 % at 4000 to 4500 K on the OFF matrices). The Linux binary carries DF_1_NODELETE.
+  The panel hint about the white balance is corrected after 1.9.8 (in the next build).
 
 ## New in 1.9.7
 

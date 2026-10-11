@@ -287,8 +287,9 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     d.choice("cameraMatrix", "Camera Matrix", CAM_OPTIONS, 2, 0, "raw",
              "As Recorded: the file's ColorMatrix1/2. In Color Mode OFF those are a Rec.709 stand-in, not a sensor "
              "calibration, so colour comes out at about half chroma. Chart-Fitted: a ColorChecker fit of the fp "
-             "sensor (CIEDE2000 1.7 vs 9.6 for OFF) with the same white balance and Temp/Tint. Daylight-fitted; "
-             "under tungsten it is adapted, not yet measured.");
+             "sensor (the contributor's measurement: CIEDE2000 1.7 vs 9.6 for OFF). With White Balance As Shot the "
+             "balance is unchanged; with a preset or a Custom temperature it shifts (blue up to about 15 % around 4000 "
+             "to 4500 K), so set Temp again. Daylight-fitted; under tungsten it is adapted, not yet measured.");
     d.choice("colorSpace", "Color Space", CS_OPTIONS, 7, 0, "raw", "Output primaries. ARRI Wide Gamut 3 with Linear gamma "
              "feeds a Color Space Transform to LogC3 for ARRI LUTs.");
     d.choice("gamma", "Gamma", GAMMA_OPTIONS, 7, 3, "raw", "Output encoding. Rec.709 has a linear toe; pure Gamma 2.2/2.4 make near-black noise sparkle. Use DaVinci Wide Gamut / DaVinci Intermediate in a DWG-managed project.");
