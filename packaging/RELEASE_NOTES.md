@@ -1,11 +1,6 @@
 ## What's new
 
-- **Camera Matrix: Chart-Fitted (daylight)**, a new choice in Camera RAW (Develop RAW on): a ColorChecker fit of the fp's sensor in place of the file's own matrices, with the same white balance. *As Recorded* stays the default. Contributed by lukaDen.
-- **ARRI Wide Gamut 3** as an output Color Space. Contributed by lukaDen.
-- **Linux: the plug-in no longer shows "Failed to load" in Resolve.** Contributed by jedypod.
-- Vignette Correction with Develop RAW on no longer puts faint green and magenta patches into dim areas.
-- When Resolve says "Sigma fp RAW could not be run successfully", the reason is now written to `SigmaFpRaw/log.txt` in the user's local app-data folder (`%LOCALAPPDATA%` on Windows, `~/Library/Caches` on a Mac) and shown in the Clip line of Clip Info.
-- Lens Correction and Stabilisation are laid out with their own status lines; less GPU memory is used with Develop RAW off.
+- **Fix: blown highlights came out yellow with a preset or Custom white balance** (Develop RAW on). They are neutral again, as they already were with As Shot. Colours below clipping are unchanged.
 
 ## Downloads
 

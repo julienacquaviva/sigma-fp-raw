@@ -237,7 +237,11 @@ ColorSetup color_setup(const DngInfo& d, bool asShot, double temp, double tint, 
         mulv(color_matrix(cmp, wx, wy), XYZ, neutral);
         for (double& n : neutral) n = std::max(1e-6, n);
     }
-    for (double& n : neutral) n = n / neutral[1] * 1.0;
+    // Green = 1. (Dividing in place by neutral[1] left the blue undivided: with a preset or Custom white
+    // balance the blue gain was off by the green's factor, made up for in the matrix, so that the colours
+    // were right but clipped highlights, which are cut at the gains, came out yellow.)
+    const double green = neutral[1];
+    for (double& n : neutral) n /= green;
     ColorSetup s{};
     for (int i = 0; i < 3; ++i) s.wb[i] = static_cast<float>(1.0 / (neutral[i] / neutral[1]));
     xy_to_temp_tint(wx, wy, s.temp, s.tint);

@@ -1,5 +1,13 @@
 # Sigma fp RAW: changes by version
 
+## New in 1.9.9
+
+- color_setup: the camera neutral was divided by its green in place, which left the blue undivided. With a preset or Custom
+  white balance the blue gain was off by the green's factor (made up for in the matrix, so colours were right), but the
+  highlight clip, which is cut at the gains, left clipped areas yellow (B/G 0.57 to 0.70 measured on A001_025). In the code
+  since 1.4.0. As Shot was not affected (the file's neutral already has green = 1).
+- The Camera Matrix hint states the white balance behaviour correctly.
+
 ## New in 1.9.8
 
 - Camera Matrix choice (As Recorded / Chart-Fitted (daylight), src/fp_chart_matrix.h) and ARRI Wide Gamut 3 output
