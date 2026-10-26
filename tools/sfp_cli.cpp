@@ -334,6 +334,15 @@ static bool colour_selftest() {
     std::printf("chart matrix colour: chart-fitted vs fit %.5f %s, as recorded vs fit %.3f %s\n", fit, fit < 1e-3 ? "ok" : "FAIL",
                 rec, rec > 0.1 ? "(control caught)" : "(control MISSED)");
     ok = ok && fit < 1e-3 && rec > 0.1;
+    // 2b. At Standard A the decoder reproduces the header's StdA colour (kFpChartStdATo709); the recorded OFF pair does not
+    // (control). Catches a hand-edited slot or a decoder that reads it wrongly, which the white checks miss (each slot still
+    // maps its white to 1,1,1). Both constants come from the same fit, so the fit itself is judged by the chart score.
+    neutral_for(off1, kFpChartWhite[0][0], kFpChartWhite[0][1]);
+    double fitA = maxdiff(color_setup(d, true, 0, 0, Primaries::Rec709, CameraMatrix::ChartFitted).matrix, kFpChartStdATo709);
+    double recA = maxdiff(color_setup(d, true, 0, 0, Primaries::Rec709, CameraMatrix::AsRecorded).matrix, kFpChartStdATo709);
+    std::printf("chart matrix colour StdA: chart-fitted vs slot %.5f %s, as recorded vs slot %.3f %s\n", fitA, fitA < 1e-3 ? "ok" : "FAIL",
+                recA, recA > 0.1 ? "(control caught)" : "(control MISSED)");
+    ok = ok && fitA < 1e-3 && recA > 0.1;
     // 3. Idempotent: a file that already carries the chart pair decodes the same either way.
     CmPair once = chart_fitted_matrices(recorded_matrices(d)), twice = chart_fitted_matrices(once);
     double idem = 0;

@@ -43,7 +43,7 @@ def main():
     assert raw_controls <= params, raw_controls - params
     assert {'rowPhase', 'deZigzag', 'fit'} <= params and not {'rowPhaseMode', 'deZigzagMode'} & params
     assert host.choices('whiteBalance') == ['As Shot', 'Daylight', 'Cloudy', 'Shade', 'Tungsten', 'Fluorescent', 'Flash', 'Custom']
-    assert host.choices('cameraMatrix') == ['As Recorded', 'Chart-Fitted (daylight)'] and host.get('cameraMatrix') == 0 and host.choices('colorSpace')[6] == 'ARRI Wide Gamut 3'
+    assert host.choices('cameraMatrix') == ['As Recorded', 'Chart-Fitted'] and host.get('cameraMatrix') == 0 and host.choices('colorSpace')[6] == 'ARRI Wide Gamut 3'
     ok('load, describe, instance; Camera RAW + Sigma fp controls declared', controls=len(params))
 
     # Controls taken out of the panel in v1.3: still parameters (old projects load), hidden, at their defaults.

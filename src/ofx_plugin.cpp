@@ -70,7 +70,7 @@ const OfxMessageSuiteV1* gMsg1 = nullptr;
 // ---- parameter names ----
 const char* WB_OPTIONS[] = {"As Shot", "Daylight", "Cloudy", "Shade", "Tungsten", "Fluorescent", "Flash", "Custom"};
 const char* CS_OPTIONS[] = {"Rec.709", "P3 D65", "Rec.2020", "DaVinci Wide Gamut", "ACES AP0", "ACES AP1", "ARRI Wide Gamut 3"};
-const char* CAM_OPTIONS[] = {"As Recorded", "Chart-Fitted (daylight)"};
+const char* CAM_OPTIONS[] = {"As Recorded", "Chart-Fitted"};
 const char* SOURCE_GAMMAS[] = {"Linear", "Gamma 2.2", "Gamma 2.4", "Gamma 2.6", "Rec.709", "sRGB", "Blackmagic Design Film", "Blackmagic Design 4K Film",
                                "Blackmagic Design 4.6K Film", "DaVinci Intermediate", "ACEScct", "Off"};
 const char* GAMMA_OPTIONS[] = {"Linear", "Gamma 2.2", "Gamma 2.4", "Rec.709", "sRGB", "DaVinci Intermediate", "ACEScct"};
@@ -287,9 +287,10 @@ OfxStatus describe_in_context(OfxImageEffectHandle h) {
     d.choice("cameraMatrix", "Camera Matrix", CAM_OPTIONS, 2, 0, "raw",
              "As Recorded: the file's ColorMatrix1/2. In Color Mode OFF those are a Rec.709 stand-in, not a sensor "
              "calibration, so colour comes out at about half chroma. Chart-Fitted: a ColorChecker fit of the fp "
-             "sensor (the contributor's measurement: CIEDE2000 1.7 vs 9.6 for OFF). With White Balance As Shot the "
-             "balance is unchanged; with a preset or a Custom temperature it shifts (blue up to about 15 % around 4000 "
-             "to 4500 K), so set Temp again. Daylight-fitted; under tungsten it is adapted, not yet measured.");
+             "sensor (the contributor's measurement on the charts it was fitted to: CIEDE2000 1.9 vs 9.8 for OFF in daylight, "
+             "3.0 vs 10.1 under 3200 K tungsten). With White Balance As Shot the balance is unchanged; with a preset or a "
+             "Custom temperature it shifts (blue up to about 14.5 % around 4200 K), so set Temp again. Fitted in daylight "
+             "and under tungsten.");
     d.choice("colorSpace", "Color Space", CS_OPTIONS, 7, 0, "raw", "Output primaries. ARRI Wide Gamut 3 with Linear gamma "
              "feeds a Color Space Transform to LogC3 for ARRI LUTs.");
     d.choice("gamma", "Gamma", GAMMA_OPTIONS, 7, 3, "raw", "Output encoding. Rec.709 has a linear toe; pure Gamma 2.2/2.4 make near-black noise sparkle. Use DaVinci Wide Gamut / DaVinci Intermediate in a DWG-managed project.");

@@ -89,7 +89,7 @@ machines for every change, but they have not yet been tried inside DaVinci Resol
 | Resolve Input Scaling | Develop RAW off only: how Resolve places a clip of another shape than the timeline, *Scale to Fit* (its default) or *Fill*. Needed for the stabilisation and the lens corrections to line up. |
 | Decode Quality | *Full Res.* (RCD demosaic) or *Half Res.* (2×2 binned, fastest) |
 | White Balance | As Shot, Daylight, Cloudy, Shade, Tungsten, Fluorescent, Flash, Custom. Editing *Color Temp* or *Tint* switches to Custom. |
-| Camera Matrix | *As Recorded* (the file's ColorMatrix1/2) or *Chart-Fitted (daylight)*: see below |
+| Camera Matrix | *As Recorded* (the file's ColorMatrix1/2) or *Chart-Fitted*: see below |
 | Color Space | Rec.709, P3 D65, Rec.2020, DaVinci Wide Gamut, ACES AP0, ACES AP1, ARRI Wide Gamut 3. AWG3 with Linear gamma feeds a Color Space Transform to LogC3, for ARRI LUTs. |
 | Gamma | Linear, 2.2, 2.4, Rec.709, sRGB, DaVinci Intermediate, ACEScct |
 | Exposure, Sharpness, Highlights, Shadows, Color Boost, Saturation, Midtones, Lift, Gain, Contrast | As in Resolve's CinemaDNG panel: same names, layout and ranges. The response is this plug-in's own, not Blackmagic's. |
@@ -100,20 +100,26 @@ In Color Mode OFF the fp writes a Rec.709 stand-in into ColorMatrix1/2, not a se
 OFF clips decode at about half chroma; the colour modes carry Sigma's calibration. *Chart-Fitted* swaps in
 a ColorChecker fit of the fp sensor and keeps the camera neutral the file's own matrices give at the two
 calibration whites (Standard A and D65). With White Balance *As Shot* the balance is therefore unchanged. With a
-preset or a *Custom* temperature between those whites it shifts (checked on the OFF matrices: red gain about +3.5 %,
-blue gain up to about +16 % around 4000 to 4500 K), so set Temp again after switching. Measured by the contributor through this plug-in (`sfp_cli develop`, Rec.709
-linear, ColorChecker 24, CIEDE2000 mean of the 18 colour patches, white balance as shot):
+preset or a *Custom* temperature between those whites it shifts (checked on the OFF matrices: red gain up to about +3.6 %,
+blue gain up to about +14.5 %, largest around 4200 K), so set Temp again after switching. Under a measured 3200 K lamp, Temp 3200
+Tint 0 misses the chart's grey on blue by about 13.5 % with *Chart-Fitted* and 23 % with *As Recorded* (that lamp also reads
+about Tint +10). Measured by the contributor through this
+plug-in (`sfp_cli develop`, Rec.709 linear, ColorChecker 24, CIEDE2000 mean of the 18 colour patches; white balance as shot in daylight,
+set to the chart's grey under tungsten):
 
 | Clip | As Recorded | Chart-Fitted |
 |---|---|---|
-| Color Mode OFF | 9.84 | **1.88** |
-| A colour mode (Sigma's calibration) | 6.42 | **1.98** |
+| Daylight, Color Mode OFF | 9.84 | **1.88** |
+| Daylight, a colour mode (Sigma's calibration) | 6.42 | **1.98** |
+| Tungsten 3200 K, Color Mode OFF | 10.08 | **3.03** |
+| Tungsten 3200 K, a colour mode (Sigma's calibration) | 5.98 | **3.06** |
 
-Fitted in daylight on one body (FW 5.02). Under tungsten it is the daylight fit, chromatically adapted, not
-yet a measured tungsten matrix: simulated with published fp spectral sensitivities (Solomatov & Akkaynak,
-ICCP 2023), it scores 5.3 there, still half of OFF's 10.3 but no better than Sigma's own tungsten matrix (4.8).
-A tungsten chart fit is next. The values live in `src/fp_chart_matrix.h`; `sfp_cli selftest` checks
-white balance, idempotence and the colour, each against a control that must fail. Command line:
+Fitted on two fp bodies (FW 5.02): in daylight, and under a 3200 K tungsten lamp (Osram DXW, chart shot by robobar);
+the Standard A slot is the tungsten fit, Bradford-adapted. Temperatures in between blend the two, as in the DNG spec.
+The table scores each matrix on the chart it was fitted to; on patches left out of the fit (leave-one-out) it scores
+about 3.5 under tungsten and 2.0 in daylight. The values live in `src/fp_chart_matrix.h`;
+`sfp_cli selftest` checks white balance, idempotence and that the decoder reproduces the header's colour at both
+calibration whites, each against a control that must fail. Command line:
 `cam=chart`, `cs=awg3`.
 
 **Fit** and **Transform**
